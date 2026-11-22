@@ -1,0 +1,43 @@
+{
+  "note": "L2: trained on prefetch-corrected L2 data (features_l2pf_v1), chosen by LOMO replay on train models (results/lomo_replay_l2pf_slice.csv): v3 features, P(keep)>=0.5, L2 slice 0.9 (size ratio, prefetch fills kept, not kv_cache). L3: policy_final_v1 (v1 features, 0.3) + slice 0.5 with size hint (results/replay_tune_slice_v2). Both with set dueling vs LRU.",
+  "features_l2": [
+    "role_id",
+    "cmd_id",
+    "used_next",
+    "dead",
+    "first_touch",
+    "prev_dist_log2",
+    "t_retouch8",
+    "t_dist"
+  ],
+  "thr_l2": 0.5,
+  "slice_l2": 0.9,
+  "source_l2": "policy_l2pf_v3",
+  "features_l3": [
+    "role_id",
+    "cmd_id",
+    "tsize_log2",
+    "used_next",
+    "dead",
+    "first_touch",
+    "prev_dist_log2",
+    "n_prev",
+    "t_retouch8",
+    "t_dist"
+  ],
+  "thr_l3": 0.3,
+  "slice_l3": 0.5,
+  "source_l3": "policy_final_v1 (policy_v1 l3)",
+  "features": [
+    "role_id",
+    "cmd_id",
+    "tsize_log2",
+    "used_next",
+    "dead",
+    "first_touch",
+    "prev_dist_log2",
+    "n_prev",
+    "t_retouch8",
+    "t_dist"
+  ]
+}

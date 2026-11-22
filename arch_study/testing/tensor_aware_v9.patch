@@ -1,0 +1,2824 @@
+diff --git a/src/mem/cache/base.cc b/src/mem/cache/base.cc
+index f6563e176e..2bf2a77237 100644
+--- a/src/mem/cache/base.cc
++++ b/src/mem/cache/base.cc
+@@ -603,8 +603,13 @@ BaseCache::recvTimingResp(PacketPtr pkt)
+         DPRINTF(Cache, "Block for addr %#llx being updated in Cache\n",
+                 pkt->getAddr());
+ 
+-        const bool allocate = (writeAllocator && mshr->wasWholeLineWrite) ?
++        bool allocate = (writeAllocator && mshr->wasWholeLineWrite) ?
+             writeAllocator->allocate() : mshr->allocOnFill();
++        // Step 8 (arch_study): a shared read fill the replacement policy
++        // marks as streaming is not allocated (served via tempBlock)
++        if (allocate && !blk && pkt->cmd == MemCmd::ReadResp &&
++            tags->wantBypass(pkt))
++            allocate = false;
+         blk = handleFill(pkt, blk, writebacks, allocate);
+         assert(blk != nullptr);
+         ppFill->notify(CacheAccessProbeArg(pkt, accessor));
+diff --git a/src/mem/cache/replacement_policies/ReplacementPolicies.py b/src/mem/cache/replacement_policies/ReplacementPolicies.py
+index 47eaabf5f5..33fa82a2d3 100644
+--- a/src/mem/cache/replacement_policies/ReplacementPolicies.py
++++ b/src/mem/cache/replacement_policies/ReplacementPolicies.py
+@@ -175,3 +175,187 @@ class WeightedLRURP(LRURP):
+     type = "WeightedLRURP"
+     cxx_class = "gem5::replacement_policy::WeightedLRU"
+     cxx_header = "mem/cache/replacement_policies/weighted_lru_rp.hh"
++
++
++class TensorAwareRP(BaseReplacementPolicy):
++    """Tensor-aware policy learned from Belady's OPT (UROP project)."""
++
++    type = "TensorAwareRP"
++    cxx_class = "gem5::replacement_policy::TensorAware"
++    cxx_header = "mem/cache/replacement_policies/tensor_aware_rp.hh"
++    level = Param.Int("cache level whose learned tree is used (2 or 3)")
++    num_sets = Param.Unsigned("number of sets of the cache")
++    assoc = Param.Unsigned(Parent.assoc, "associativity of the cache")
++    hint_file = Param.String("", "tensor hint table (physical ranges, layers)")
++    dueling = Param.Bool(True, "set dueling against LRU as a safety net")
++    reset_history_at_roi = Param.Bool(
++        True, "forget access history at stats reset (start of the ROI)"
++    )
++    dump_file = Param.String("", "CSV dump of decisions after stats reset")
++    dump_max = Param.Unsigned(0, "max decisions to dump")
++    slice_beta = Param.Float(
++        0.0, "thrash protection: keep slice beta/2^t_dist of a thrashing tensor (0 = off)"
++    )
++    slice_size_hint = Param.Bool(
++        True, "start the slice from the tensor-size hint before reuse is seen"
++    )
++    l2_tree_alt = Param.Bool(
++        False, "L2: use the alternative tree (trained on Demand-MIN labels)"
++    )
++    slice_size_ratio = Param.Bool(
++        False,
++        "L2 form: slice by exact tensor/cache size ratio, keep prefetch fills",
++    )
++    slice_ws_alpha = Param.Float(
++        0.0,
++        "Step 4 working-set slice (0 = off): a weight tensor of a layer whose "
++        "weights (hint: role, layer mask, bytes) exceed the cache keeps a "
++        "fixed hash slice alpha * cache / layer-weight-bytes from first touch",
++    )
++    dirty_aware = Param.Bool(
++        False, "Step 4: on victim ties prefer a clean line (no DRAM write)"
++    )
++    duel_lru_default = Param.Bool(
++        False,
++        "Step 4: follower sets use LRU until the tree has proven fewer misses "
++        "(PSEL > 512); the hint-based working-set slice applies in all non-LRU-"
++        "leader sets regardless of the duel",
++    )
++    pf_by_requestor = Param.Bool(
++        False,
++        "Step 5 fix (L2): recognise the cache's own prefetch fills by the "
++        "requestor (name contains 'prefetcher'): gem5 delivers them as plain "
++        "read responses, so cmd_id would otherwise be 0 instead of 3",
++    )
++    system = Param.System(Parent.any, "system (requestor names)")
++    keep_prefetch = Param.Bool(
++        False,
++        "Step 5 (L2): a prefetch fill is always kept (never inserted as "
++        "'evict first'), so the prefetcher's work is not thrown away",
++    )
++    slice_contig = Param.Bool(
++        False,
++        "Step 5: the working-set slice keeps a CONTIGUOUS first part of each "
++        "weight tensor (by physical address) instead of hashed lines, so the "
++        "rest streams with a regular stride for the prefetcher",
++    )
++    slice_contig_min = Param.Float(
++        0.0,
++        "with slice_contig: use the contiguous slice only for tensors whose "
++        "kept fraction is >= this (smaller slices stay hashed)",
++    )
++    slice_pack = Param.Bool(
++        False,
++        "Step 6 packing: per layer whose weights exceed the cache, keep WHOLE "
++        "weight tensors (largest first) within alpha * cache, a contiguous "
++        "part of the next one, and stream the rest (instead of the same "
++        "hashed fraction of every weight)",
++    )
++    coord_l2_bytes = Param.UInt64(
++        0,
++        "Step 6 coordination (L3 only, 0 = off): size of the L2 above. The L3 "
++        "recomputes the L2's working-set slice of every weight tensor from "
++        "the same hint, does not keep those lines (L2 holds them) and keeps a "
++        "slice of the OTHER lines instead, so L2 + L3 hold different parts",
++    )
++    coord_l2_alpha = Param.Float(0.9, "alpha of the L2 slice (as the L2 uses)")
++    coord_l2_pack = Param.Bool(
++        False, "the L2 above uses the packing plan (slice_pack) - recompute it so"
++    )
++    set_aware_ways = Param.Unsigned(
++        0, "Step 12b: kept lines per set in the set-aware plan (0 = alpha * ways)"
++    )
++    duel_brrip = Param.Bool(
++        False,
++        "Step 12: second set duel against a BRRIP-style mode (insert at RRPV "
++        "7, 1 in 32 kept, hits promoted): leaders set%64==2 (BRRIP) and ==3 "
++        "(this policy); followers switch to BRRIP mode only when its leaders "
++        "miss clearly less (margin 32)",
++    )
++    first_touch = Param.Bool(
++        False,
++        "Step 13: set-aware plan picks the kept lines in first-touch order "
++        "(same per-tensor budget and per-set cap) instead of address order",
++    )
++    set_aware = Param.Bool(
++        False,
++        "Step 11: set-aware plan - lines of planned tensors (not coordinated "
++        "with the L2) are kept only while their cache set holds fewer than "
++        "alpha * ways kept lines (address order, weights first); lines that "
++        "would overflow a crowded set are streamed",
++    )
++    bip_stream = Param.Unsigned(
++        0,
++        "Step 10b: bimodal insertion for streaming decisions (0 = off): one "
++        "in N lines this policy would insert as streaming (RRPV 7) is kept "
++        "instead, so sets that thrash keep a stable part (as BRRIP)",
++    )
++    out_stream = Param.Bool(
++        False,
++        "Step 10: lines of an output tensor (role 2) that no later layer reads "
++        "(hint: its last user layer is the current one) are inserted as "
++        "streaming (RRPV 7) - written once, not reused here",
++    )
++    pos_by_bytes = Param.Bool(
++        False,
++        "Step 9: position of a line inside its tensor = tensor bytes before it "
++        "(over the tensor's own address ranges) / tensor bytes, instead of "
++        "(addr - lowest) / physical extent (wrong when other data is mixed in)",
++    )
++    plan_activations = Param.Bool(
++        False,
++        "Step 9: with slice_pack, input activations (role 1) of a layer whose "
++        "weights + inputs exceed the cache get the budget the weights leave "
++        "(weights first, then inputs largest first, contiguous slices)",
++    )
++    coord_fit_layers = Param.Bool(
++        False,
++        "Step 8: L3 coordination also for layers that fit the L3: the L2 packs "
++        "them (mixed plan), so the L3 does not keep the L2's packed part",
++    )
++    dead_demote = Param.Bool(
++        False,
++        "Step 8 (DCO-style tensor lifetime): a line whose tensor's last user "
++        "layer has finished is evicted first (RRPV 7)",
++    )
++    bypass_streaming = Param.Bool(
++        False,
++        "Step 8 (OPT+ bypass): at L3, a shared read fill that the hint slice "
++        "marks as streaming (not kept) is not allocated",
++    )
++    pack_max_layer_bytes = Param.UInt64(
++        0,
++        "Step 7 mixed plan (with slice_pack, 0 = pack every layer): pack only "
++        "layers whose weights are <= this (e.g. the L3 size); bigger layers "
++        "keep the even slice, which the L3 coordination relies on",
++    )
++    l2_tree_v3 = Param.Int(
++        -1,
++        "Step 7 learned L2 tree (tensor_aware_tree_v3.hh, -1 = off): 0-3 = "
++        "trained without ViT/BERT/DLRM/RNN-T, 4 = all; uses the hint features "
++        "pos16, plan16, over_log2, inplan, prev_pf and replaces the L2 slice "
++        "decision (prefetch fills still kept with keep_prefetch)",
++    )
++    coord_l2_contig_min = Param.Float(
++        0.35, "contiguous-slice threshold of the L2 (as the L2 uses)"
++    )
++    tree_off = Param.Bool(
++        False,
++        "Step 5: do not use the learned tree (every access is 'keep', i.e. "
++        "LRU order); hint-based slices still apply",
++    )
++    duel_reads_only = Param.Bool(
++        False,
++        "Step 5 fix: set dueling counts only demand READ misses (cmd 0/1); "
++        "writebacks from the upper cache and prefetch fills are not misses",
++    )
++    duel_demand_only = Param.Bool(
++        False,
++        "Step 5 (L2): set dueling counts only demand misses (prefetch fills "
++        "are not misses the core waits for)",
++    )
++    duel_skip_first = Param.Bool(
++        False,
++        "Step 4: set dueling counts only misses on lines seen before at "
++        "this level (first-touch misses are the same for every policy)",
++    )
+diff --git a/src/mem/cache/replacement_policies/SConscript b/src/mem/cache/replacement_policies/SConscript
+index e0cd7663c2..e81b581ad0 100644
+--- a/src/mem/cache/replacement_policies/SConscript
++++ b/src/mem/cache/replacement_policies/SConscript
+@@ -31,7 +31,8 @@ Import('*')
+ SimObject('ReplacementPolicies.py', sim_objects=[
+     'BaseReplacementPolicy', 'DuelingRP', 'FIFORP', 'SecondChanceRP',
+     'LFURP', 'LRURP', 'BIPRP', 'MRURP', 'RandomRP', 'BRRIPRP', 'SHiPRP',
+-    'SHiPMemRP', 'SHiPPCRP', 'TreePLRURP', 'WeightedLRURP'])
++    'SHiPMemRP', 'SHiPPCRP', 'TreePLRURP', 'WeightedLRURP',
++    'TensorAwareRP'])
+ 
+ Source('bip_rp.cc')
+ Source('brrip_rp.cc')
+@@ -45,6 +46,7 @@ Source('second_chance_rp.cc')
+ Source('ship_rp.cc')
+ Source('tree_plru_rp.cc')
+ Source('weighted_lru_rp.cc')
++Source('tensor_aware_rp.cc')
+ 
+ GTest('replaceable_entry.test', 'replaceable_entry.test.cc')
+ GTest('tree_plru_rp.test', 'tree_plru_rp.cc', 'tree_plru_rp.test.cc',
+diff --git a/src/mem/cache/replacement_policies/base.hh b/src/mem/cache/replacement_policies/base.hh
+index 2c23c950b2..c92d5ede1c 100644
+--- a/src/mem/cache/replacement_policies/base.hh
++++ b/src/mem/cache/replacement_policies/base.hh
+@@ -103,6 +103,12 @@ class Base : public SimObject
+     virtual ReplaceableEntry* getVictim(
+                            const ReplacementCandidates& candidates) const = 0;
+ 
++    /**
++     * Step 8 (arch_study): should a fill of this response NOT be allocated
++     * (bypass)? Default: never.
++     */
++    virtual bool bypass(const PacketPtr pkt) { return false; }
++
+     /**
+      * Instantiate a replacement data entry.
+      *
+diff --git a/src/mem/cache/replacement_policies/tensor_aware_rp.cc b/src/mem/cache/replacement_policies/tensor_aware_rp.cc
+new file mode 100644
+index 0000000000..4ca711acd9
+--- /dev/null
++++ b/src/mem/cache/replacement_policies/tensor_aware_rp.cc
+@@ -0,0 +1,954 @@
++/*
++ * Tensor-aware replacement policy (UROP project, SRM University-AP).
++ * See tensor_aware_rp.hh.
++ */
++
++#include "mem/cache/replacement_policies/tensor_aware_rp.hh"
++
++#include "mem/cache/cache_blk.hh"
++
++#include <algorithm>
++#include <cassert>
++#include <cmath>
++#include <fstream>
++#include <sstream>
++
++#include "base/logging.hh"
++#include "mem/cache/replacement_policies/tensor_aware_tree.hh"
++#include "mem/cache/replacement_policies/tensor_aware_tree_v3.hh"
++#include "params/TensorAwareRP.hh"
++
++namespace gem5
++{
++
++namespace replacement_policy
++{
++
++int TensorAware::curLayer = 1;
++
++TensorAware::TAStats::TAStats(statistics::Group *parent)
++  : statistics::Group(parent),
++    ADD_STAT(keepDecisions, statistics::units::Count::get(),
++             "accesses the tree predicted as keep"),
++    ADD_STAT(averseDecisions, statistics::units::Count::get(),
++             "accesses the tree predicted as not keep"),
++    ADD_STAT(lruLeaderMisses, statistics::units::Count::get(),
++             "fills in the LRU leader sets"),
++    ADD_STAT(treeLeaderMisses, statistics::units::Count::get(),
++             "fills in the tree leader sets"),
++    ADD_STAT(followerTreeAccesses, statistics::units::Count::get(),
++             "follower-set accesses that used the tree"),
++    ADD_STAT(followerLruAccesses, statistics::units::Count::get(),
++             "follower-set accesses that used LRU"),
++    ADD_STAT(tensorAccesses, statistics::units::Count::get(),
++             "accesses whose address is inside a hinted tensor")
++{
++}
++
++TensorAware::TensorAware(const Params &p)
++  : Base(p), level(p.level), numSets(p.num_sets), assoc(p.assoc),
++    dueling(p.dueling), blkShift(6),
++    capLines(double(p.num_sets) * p.assoc),
++    setKeep(p.num_sets, 0), dumpMax(p.dump_max),
++    resetHistory(p.reset_history_at_roi), sliceBeta(p.slice_beta),
++    sliceSizeHint(p.slice_size_hint), sliceSizeRatio(p.slice_size_ratio),
++    l2Alt(p.l2_tree_alt),
++    wsAlpha(p.slice_ws_alpha), dirtyAware(p.dirty_aware),
++    duelSkipFirst(p.duel_skip_first), duelLruDefault(p.duel_lru_default),
++    duelDemandOnly(p.duel_demand_only), keepPrefetch(p.keep_prefetch),
++    duelReadsOnly(p.duel_reads_only), treeOff(p.tree_off),
++    sliceContig(p.slice_contig), sliceContigMin(p.slice_contig_min),
++    slicePack(p.slice_pack),
++    coordL2Bytes(p.coord_l2_bytes), coordL2Alpha(p.coord_l2_alpha),
++    coordL2ContigMin(p.coord_l2_contig_min), coordL2Pack(p.coord_l2_pack),
++    l2TreeV3(p.l2_tree_v3),
++    packMaxLayer(p.pack_max_layer_bytes),
++    planAct(p.plan_activations), posByBytes(p.pos_by_bytes),
++    outStream(p.out_stream), bipStream(p.bip_stream),
++    setAware(p.set_aware), setAwareWays(p.set_aware_ways),
++    duelBrrip(p.duel_brrip), firstTouch(p.first_touch),
++    coordFit(p.coord_fit_layers),
++    deadDemote(p.dead_demote), bypassStreaming(p.bypass_streaming),
++    pfByRequestor(p.pf_by_requestor), system(p.system),
++    taStats(this)
++{
++    if (!p.dump_file.empty())
++        dump.open(p.dump_file);
++    fatal_if(level != 2 && level != 3, "TensorAwareRP: level must be 2 or 3");
++    fatal_if(numSets == 0 || (numSets & (numSets - 1)),
++             "TensorAwareRP: num_sets must be a power of two");
++    if (!p.hint_file.empty())
++        loadHints(p.hint_file);
++    tstats.resize(users.size() + 1);
++    computeWsFrac();
++}
++
++// Step 4 working-set slice. Weights (role 0) are re-read for every row /
++// sample / time step of their layer. If the weights of a layer together are
++// larger than this cache, LRU loses all of them on every pass; keeping a
++// fixed hash slice of fraction alpha * cache / W (the same lines on every
++// pass) keeps the reusable part. W comes from the hint alone (layer masks,
++// tensor bytes, roles), so the decision is right from the first touch.
++bool
++TensorAware::isPrefetcher(const PacketPtr pkt)
++{
++    if (!system || !pkt->req)
++        return false;
++    const int id = pkt->req->requestorId();
++    auto it = pfRequestor.find(id);
++    if (it == pfRequestor.end()) {
++        const std::string n = system->getRequestorName(id);
++        it = pfRequestor.emplace(id, n.find("prefetcher") != std::string::npos).first;
++        inform("TensorAwareRP L%d: requestor %d '%s' prefetcher=%d", level, id,
++               n, int(it->second));
++    }
++    return it->second;
++}
++
++void
++TensorAware::computeWsFrac()
++{
++    wsFrac.assign(users.size(), 0.0);
++    wsPlan.assign(users.size(), 0);
++    if (wsAlpha <= 0 || users.empty())
++        return;
++    std::vector<int> trole(users.size(), -1);
++    tLo.assign(users.size(), ~Addr(0));
++    tHi.assign(users.size(), 0);
++    tSum.assign(users.size(), 0.0);
++    for (auto &kv : ranges)
++        if (kv.second.tensor >= 0 && kv.second.tensor < (int)trole.size()) {
++            const int t = kv.second.tensor;
++            kv.second.cum = tSum[t];
++            tSum[t] += double(kv.second.end - kv.first);
++            trole[t] = kv.second.role;
++            tLo[t] = std::min(tLo[t], kv.first);
++            tHi[t] = std::max(tHi[t], kv.second.end);
++        }
++    const double cap = capLines * 64;
++    wsFrac = planFrac(cap, wsAlpha, slicePack, trole, wsPlan);
++    // Step 7 mixed plan: tensors of layers bigger than packMaxLayer keep the
++    // even slice (as without packing); the others use the packed plan
++    packedT.assign(users.size(), slicePack ? 1 : 0);
++    if (slicePack && packMaxLayer > 0) {
++        std::vector<char> pe;
++        const std::vector<double> fe = planFrac(cap, wsAlpha, false, trole, pe);
++        double lw[32] = {0};
++        for (size_t t = 0; t < users.size(); ++t)
++            if (trole[t] == 0)
++                for (int k = 0; k < 32; ++k)
++                    if (users[t] >> k & 1)
++                        lw[k] += double(tbytes[t]);
++        int ne = 0;
++        for (size_t t = 0; t < users.size(); ++t) {
++            double w = 0;
++            for (int k = 0; k < 32; ++k)
++                if (users[t] >> k & 1)
++                    w = std::max(w, lw[k]);
++            if (w > double(packMaxLayer)) {
++                wsFrac[t] = fe[t];
++                wsPlan[t] = pe[t];
++                packedT[t] = 0;
++                ne += pe[t] != 0;
++            }
++        }
++        inform("TensorAwareRP L%d: mixed plan, %d weight tensors of layers "
++               "> %llu bytes keep the even slice", level, ne,
++               (unsigned long long)packMaxLayer);
++    }
++    // Step 7 feature over_log2 (train_l2_v3.py): log2 of the largest weight
++    // working set among the tensor's layers over this cache, -4..8
++    {
++        double layerW[32] = {0};
++        for (size_t t = 0; t < users.size(); ++t)
++            if (trole[t] == 0)
++                for (int k = 0; k < 32; ++k)
++                    if (users[t] >> k & 1)
++                        layerW[k] += double(tbytes[t]);
++        overLog2.assign(users.size(), -4);
++        for (size_t t = 0; t < users.size(); ++t) {
++            double w = 0;
++            for (int k = 0; k < 32; ++k)
++                if (users[t] >> k & 1)
++                    w = std::max(w, layerW[k]);
++            if (w > 0)
++                overLog2[t] = int(std::clamp(std::nearbyint(std::log2(w / cap)),
++                                             -4.0, 8.0));
++        }
++    }
++    // Step 9: input activations get the budget the layer's weights leave
++    if (planAct && slicePack) {
++        double lw[32] = {0}, la[32] = {0};
++        for (size_t t = 0; t < users.size(); ++t)
++            for (int k = 0; k < 32; ++k)
++                if (users[t] >> k & 1) {
++                    if (trole[t] == 0)
++                        lw[k] += double(tbytes[t]);
++                    else if (trole[t] == 1)
++                        la[k] += double(tbytes[t]);
++                }
++        int na = 0;
++        for (int k = 0; k < 32; ++k) {
++            if (la[k] <= 0 || lw[k] + la[k] <= cap)
++                continue;
++            double budget = wsAlpha * cap - lw[k];   // weights first
++            if (budget <= 0)
++                continue;                            // weights use it all
++            std::vector<size_t> ts;
++            for (size_t t = 0; t < users.size(); ++t)
++                if (trole[t] == 1 && (users[t] >> k & 1))
++                    ts.push_back(t);
++            std::sort(ts.begin(), ts.end(), [&](size_t a, size_t b) {
++                return tbytes[a] > tbytes[b]; });
++            for (size_t t : ts) {
++                const double b = double(tbytes[t]);
++                if (b <= 0 || budget <= 0)
++                    break;
++                const double f = std::clamp(budget / b, 0.0, 1.0);
++                budget -= b * f;
++                wsFrac[t] = wsPlan[t] ? std::min(wsFrac[t], f) : f;
++                wsPlan[t] = 1;
++                packedT[t] = 1;
++                ++na;
++            }
++        }
++        inform("TensorAwareRP L%d: %d input activation tensors planned", level, na);
++    }
++    // Step 6 coordination: the L2 slice of each weight tensor, recomputed
++    // with the L2's capacity (same rule as the L2 instance), and the share
++    // of the remaining lines this L3 can hold.
++    l2Frac.assign(users.size(), 0.0);
++    l3RestFrac.assign(users.size(), 0.0);
++    if (coordL2Bytes > 0) {
++        std::vector<char> l2Plan;
++        const std::vector<double> f2 = planFrac(double(coordL2Bytes),
++            coordL2Alpha, coordL2Pack, trole, l2Plan);
++        int nc = 0;
++        for (size_t t = 0; t < users.size(); ++t) {
++            // only tensors of layers too big for THIS cache: when the layer
++            // fits here, the L3 keeps it whole and must not drop the L2 part
++            if (!l2Plan[t] || !wsPlan[t])
++                continue;
++            l2Frac[t] = f2[t];
++            // lines of this tensor not in the L2: the L3 keeps its own
++            // plan's share of them, scaled up since the L2 part is freed
++            const double own = wsPlan[t] ? wsFrac[t] : 1.0;
++            l3RestFrac[t] = l2Frac[t] < 1.0 ?
++                std::min(1.0, own / (1.0 - l2Frac[t])) : 0.0;
++            ++nc;
++        }
++        if (slicePack) {
++            // pack the L3 budget over the parts the L2 does not hold
++            std::vector<double> rest(users.size(), 1.0);
++            for (size_t t = 0; t < users.size(); ++t)
++                if (l2Plan[t] && wsPlan[t])
++                    rest[t] = 1.0 - l2Frac[t];
++            std::vector<char> planR;
++            const std::vector<double> fr = planFrac(cap, wsAlpha, true, trole,
++                                                    planR, &rest);
++            for (size_t t = 0; t < users.size(); ++t)
++                if (l2Plan[t] && wsPlan[t])
++                    l3RestFrac[t] = planR[t] ? fr[t] : 1.0;
++        }
++        coordPackedT.assign(users.size(), 0);
++        if (coordFit) {
++            // layers that fit this cache: the L2 packs them (mixed plan), so
++            // its part is the first l2Frac of the tensor; keep all the rest
++            std::vector<char> pp;
++            const std::vector<double> fp = planFrac(double(coordL2Bytes),
++                coordL2Alpha, true, trole, pp);
++            for (size_t t = 0; t < users.size(); ++t) {
++                if (!pp[t] || wsPlan[t] || fp[t] <= 0)
++                    continue;
++                l2Frac[t] = fp[t];
++                l3RestFrac[t] = 1.0;
++                coordPackedT[t] = 1;
++                ++nc;
++            }
++        }
++        inform("TensorAwareRP L%d: coordination with a %llu-byte L2 on %d "
++               "weight tensors", level, (unsigned long long)coordL2Bytes, nc);
++    }
++    // Step 11: set-aware plan for planned tensors the L2 does not share
++    keepBits.assign(users.size(), std::vector<bool>());
++    if (setAware && wsAlpha > 0) {
++        const int ways = int(capLines / numSets);
++        const int perSet = setAwareWays > 0 ? int(setAwareWays) :
++                           std::max(1, int(wsAlpha * ways));
++        uint64_t budget = uint64_t(wsAlpha * capLines);
++        std::vector<uint16_t> cnt(numSets, 0);
++        std::vector<size_t> ts;
++        for (size_t t = 0; t < users.size(); ++t)
++            if (wsPlan[t] && (t >= l2Frac.size() || l2Frac[t] <= 0) &&
++                tSum.size() > t && tSum[t] > 0)
++                ts.push_back(t);
++        std::sort(ts.begin(), ts.end(), [&](size_t a, size_t b) {
++            if ((trole[a] == 0) != (trole[b] == 0))
++                return trole[a] == 0;            // weights first
++            return tbytes[a] > tbytes[b]; });
++        uint64_t kept = 0;
++        for (size_t t : ts) {
++            keepBits[t].assign(size_t(tSum[t] / 64) + 1, false);
++            for (const auto &kv : ranges) {
++                if (kv.second.tensor != int(t))
++                    continue;
++                for (Addr a = kv.first; a < kv.second.end; a += 64) {
++                    const size_t idx = size_t((kv.second.cum +
++                                               double(a - kv.first)) / 64);
++                    const unsigned st = (a >> blkShift) & (numSets - 1);
++                    if (kept < budget && cnt[st] < perSet &&
++                        idx < keepBits[t].size()) {
++                        keepBits[t][idx] = true;
++                        ++cnt[st];
++                        ++kept;
++                    }
++                }
++            }
++        }
++        if (firstTouch) {
++            // same per-tensor budget, lines chosen when first touched
++            ftPerSet = perSet;
++            ftQuota.assign(users.size(), 0);
++            ftUsed.assign(users.size(), 0);
++            ftState.assign(users.size(), std::vector<uint8_t>());
++            ftCnt.assign(numSets, 0);
++            for (size_t t : ts) {
++                uint64_t q = 0;
++                for (bool b : keepBits[t])
++                    q += b;
++                ftQuota[t] = q;
++                ftState[t].assign(keepBits[t].size(), 0);
++            }
++        }
++        inform("TensorAwareRP L%d: set-aware plan on %d tensors, %llu lines "
++               "kept (%d per set max)", level, (int)ts.size(),
++               (unsigned long long)kept, perSet);
++    }
++    int n = 0;
++    for (char f : wsPlan)
++        n += f != 0;
++    inform("TensorAwareRP L%d: working-set slice alpha %.2f on %d weight tensors",
++           level, wsAlpha, n);
++}
++
++std::vector<double>
++TensorAware::planFrac(double cap, double alpha, bool pack,
++                      const std::vector<int> &trole,
++                      std::vector<char> &plan,
++                      const std::vector<double> *scale) const
++{
++    // scale: per-tensor share of its bytes that this cache must place
++    // (coordination: the part the L2 does not hold); nullptr = all
++    auto tb = [&](size_t t) {
++        return double(tbytes[t]) * (scale ? (*scale)[t] : 1.0); };
++    std::vector<double> frac(users.size(), 0.0);
++    plan.assign(users.size(), 0);
++    double layerW[32] = {0};
++    for (size_t t = 0; t < users.size(); ++t)
++        if (trole[t] == 0)
++            for (int k = 0; k < 32; ++k)
++                if (users[t] >> k & 1)
++                    layerW[k] += tb(t);
++    if (pack) {
++        // packing: per oversized layer, whole weight tensors largest first
++        // within alpha * cap, a contiguous part of the next, rest streamed
++        std::vector<double> best(users.size(), 1.0);
++        for (int k = 0; k < 32; ++k) {
++            if (layerW[k] <= cap)
++                continue;
++            std::vector<size_t> ts;
++            for (size_t t = 0; t < users.size(); ++t)
++                if (trole[t] == 0 && (users[t] >> k & 1))
++                    ts.push_back(t);
++            std::sort(ts.begin(), ts.end(), [&](size_t a, size_t b) {
++                return tb(a) > tb(b); });
++            double budget = alpha * cap;
++            for (size_t t : ts) {
++                const double b = tb(t);
++                const double f = b > 0 ? std::clamp(budget / b, 0.0, 1.0) : 1.0;
++                budget -= b * f;
++                best[t] = std::min(best[t], f);
++                plan[t] = 1;
++            }
++        }
++        for (size_t t = 0; t < users.size(); ++t)
++            if (plan[t])
++                frac[t] = best[t];
++    } else {
++        for (size_t t = 0; t < users.size(); ++t) {
++            if (trole[t] != 0)
++                continue;
++            double w = 0;
++            for (int k = 0; k < 32; ++k)
++                if (users[t] >> k & 1)
++                    w = std::max(w, layerW[k]);
++            if (w > cap) {
++                frac[t] = alpha * cap / w;
++                plan[t] = 1;
++            }
++        }
++    }
++    return frac;
++}
++
++void
++TensorAware::loadHints(const std::string &file)
++{
++    std::ifstream in(file);
++    fatal_if(!in, "TensorAwareRP: cannot open hint file %s", file);
++    std::string line;
++    while (std::getline(in, line)) {
++        if (line.empty() || line[0] == '#')
++            continue;
++        std::istringstream ss(line);
++        char kind;
++        ss >> kind;
++        if (kind == 'L') {
++            unsigned k;
++            Addr lo, hi;
++            ss >> k >> std::hex >> lo >> hi;
++            if (layerPC.size() < k)
++                layerPC.resize(k, {0, 0});
++            layerPC[k - 1] = {lo, hi};
++        } else if (kind == 'T') {
++            int idx;
++            uint32_t mask;
++            uint64_t bytes = 0;
++            ss >> idx >> mask >> bytes;
++            if ((int)users.size() <= idx) {
++                users.resize(idx + 1, 0);
++                tbytes.resize(idx + 1, 0);
++            }
++            users[idx] = mask;
++            tbytes[idx] = bytes;
++        } else if (kind == 'R') {
++            Addr lo, hi;
++            int t, r;
++            ss >> std::hex >> lo >> hi >> std::dec >> t >> r;
++            ranges[lo] = Range{hi, t, r};
++        }
++    }
++    inform("TensorAwareRP L%d: %d ranges, %d tensors, %d layers from %s",
++           level, ranges.size(), users.size(), layerPC.size(), file);
++}
++
++const TensorAware::Range *
++TensorAware::lookup(Addr addr) const
++{
++    auto it = ranges.upper_bound(addr);
++    if (it == ranges.begin())
++        return nullptr;
++    --it;
++    return addr < it->second.end ? &it->second : nullptr;
++}
++
++int
++TensorAware::cmdId(const PacketPtr pkt)
++{
++    // same classes as trace_tools/build_features.py (cmd_id); a fill is
++    // reported with the response packet, which maps to the request's class
++    switch (pkt->cmd.toInt()) {
++      case MemCmd::HardPFReq: case MemCmd::HardPFResp:
++      case MemCmd::SoftPFReq: case MemCmd::SoftPFResp:
++      case MemCmd::SoftPFExReq:
++        return 3;
++      case MemCmd::WritebackDirty: case MemCmd::WritebackClean:
++      case MemCmd::WriteReq: case MemCmd::WriteClean:
++        return 2;
++      case MemCmd::ReadExReq: case MemCmd::ReadExResp:
++      case MemCmd::UpgradeReq: case MemCmd::UpgradeResp:
++      case MemCmd::SCUpgradeReq: case MemCmd::SCUpgradeFailReq:
++      case MemCmd::UpgradeFailResp:
++        return 1;
++      case MemCmd::ReadSharedReq: case MemCmd::ReadReq:
++      case MemCmd::ReadCleanReq: case MemCmd::ReadResp:
++      case MemCmd::ReadRespWithInvalidate:
++        return 0;
++      default:
++        return 4;
++    }
++}
++
++bool
++TensorAware::predict(const int *x) const
++{
++    if (level == 2)
++        return l2Alt ? taTreeL2Alt(x) : taTreeL2(x);
++    return taTreeL3(x);
++}
++
++void
++TensorAware::access(const std::shared_ptr<ReplacementData>& rd,
++                    const PacketPtr pkt, bool fill)
++{
++    auto d = std::static_pointer_cast<TAReplData>(rd);
++    const Addr addr = pkt->getAddr();
++    const Addr line = addr >> blkShift;
++    const unsigned set = line & (numSets - 1);
++    ++seq;
++
++    // ---- software hint: tensor, role, layer ----
++    const Range *r = lookup(addr);
++    const int tensor = r ? r->tensor : -1;
++    const int role = r ? r->role : 11;   // 11 = other
++    if (tensor >= 0) {
++        ++taStats.tensorAccesses;
++        if (pkt->req && pkt->req->hasPC()) {
++            const Addr pc = pkt->req->getPC();
++            for (size_t k = 0; k < layerPC.size(); ++k)
++                if (pc >= layerPC[k].first && pc < layerPC[k].second)
++                    curLayer = std::max(curLayer, int(k) + 1);
++        }
++    }
++    int used_next = 0, dead = 0;
++    if (tensor >= 0 && tensor < (int)users.size() && users[tensor]) {
++        const uint32_t m = users[tensor];
++        const int last = 32 - __builtin_clz(m);
++        used_next = (curLayer < 32 && (m >> curLayer) & 1) ? 1 : 0;
++        dead = curLayer >= last ? 1 : 0;
++    }
++
++    // ---- per-line history at this level ----
++    LineHist &lh = lastAccess.try_emplace(line, LineHist{0, 0, false}).first->second;
++    const bool first = lh.count == 0;
++    const bool prevPf = lh.lastPf;
++    const int64_t dist = first ? -1 : int64_t(seq - lh.seq);
++    const int prev_dist_log2 = first ? -1
++        : int(std::floor(std::log2(1.0 + double(dist))));
++    const int n_prev = int(std::min<uint32_t>(lh.count, 7));
++    lh.seq = seq;
++    ++lh.count;
++    int tsize_log2 = -9;
++    if (tensor >= 0 && tensor < (int)tbytes.size() && tbytes[tensor])
++        tsize_log2 = int(std::clamp(std::nearbyint(std::log2(
++            double(tbytes[tensor]) / (capLines * 64))), -8.0, 8.0));
++
++    // ---- per-tensor counters (earlier accesses only) ----
++    TensorStat &ts = tstats[std::min<size_t>(tensor + 1, tstats.size() - 1)];
++    const int t_retouch8 = ts.n ? int(std::nearbyint(8.0 * ts.re / ts.n)) : 0;
++    const int t_dist = ts.re ? int(std::clamp(
++        std::nearbyint(ts.sumLd / ts.re), -12.0, 8.0)) : 9;
++    ++ts.n;
++    if (!first) {
++        ++ts.re;
++        ts.sumLd += std::log2(std::max<double>(dist, 1) / capLines);
++    }
++
++    // order = TA_FEATURES (trace_tools/build_features.py names)
++    int cmd = cmdId(pkt);
++    if (pfByRequestor && cmd == 0 && isPrefetcher(pkt))
++        cmd = 3;
++    lh.lastPf = cmd == 3;
++    const int x[10] = {role, cmd, tsize_log2, used_next, dead,
++                       first ? 1 : 0, prev_dist_log2, n_prev, t_retouch8,
++                       t_dist};
++    bool keep = treeOff ? true : predict(x);
++    // Tensor-aware thrash protection: a tensor whose mean reuse distance is
++    // 2^t_dist >= 1 cache capacities cannot fit; keep a fixed slice of its
++    // lines (address hash, the same lines on every pass) of size
++    // sliceBeta / 2^t_dist and stream the rest (replay_policy.slice_keep).
++    // Before any reuse of the tensor is seen (t_dist == 9) the software size
++    // hint can announce it: tensor larger than the cache (tsize_log2 >= 1).
++    if (sliceBeta > 0 && sliceSizeRatio) {
++        // L2 form: a tensor larger than the cache (exact size hint) keeps a
++        // fixed slice of size sliceBeta / (bytes / cache bytes); prefetch
++        // fills are always kept until their demand use
++        // (replay_policy.l2_slice_keep)
++        // not for the KV cache (role 4): it is reused at once by the query
++        // heads of its group (GQA), so the tree decides
++        if (tensor >= 0 && tensor < (int)tbytes.size() && role != 4) {
++            const double r = double(tbytes[tensor]) / (capLines * 64);
++            if (r > 1.0) {
++                const uint64_t hsh =
++                    ((uint64_t(line) * 2654435761ULL) >> 16) & 0xFF;
++                keep = double(hsh) < sliceBeta / r * 256.0 || x[1] == 3;
++            }
++        }
++    } else if (sliceBeta > 0) {
++        int ratio = -1;
++        if (t_dist >= 0 && t_dist <= 8)
++            ratio = t_dist;
++        else if (sliceSizeHint && t_dist == 9 && tsize_log2 >= 1 &&
++                 tsize_log2 <= 8)
++            ratio = tsize_log2;
++        if (ratio >= 0) {
++            const uint64_t hsh =
++                ((uint64_t(line) * 2654435761ULL) >> 16) & 0xFF;
++            keep = double(hsh) < sliceBeta / std::exp2(ratio) * 256.0;
++        }
++    }
++    bool wsApplies = false;
++    const bool wsKeep = sliceDecision(addr, line, tensor, wsApplies);
++    if (wsApplies)
++        keep = wsKeep;
++    // Step 7: learned L2 tree with the hint features (replaces the slice)
++    if (l2TreeV3 >= 0) {
++        int pos16 = -1, plan16 = 0, over = -4, inplan = 0;
++        if (tensor >= 0 && tensor < (int)wsFrac.size()) {
++            double pos = -1.0;
++            if (tensor < (int)tHi.size() && tHi[tensor] > tLo[tensor]) {
++                pos = tensorPos(addr, tensor);
++                pos16 = std::clamp(int(pos * 16), 0, 15);
++            }
++            const double fr = wsPlan[tensor] ? wsFrac[tensor] : 0.0;
++            plan16 = int(std::nearbyint(fr * 16));
++            over = tensor < (int)overLog2.size() ? overLog2[tensor] : -4;
++            inplan = (fr > 0 && pos < fr) ? 1 : 0;
++        }
++        const int x15[15] = {x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7],
++                             x[8], x[9], pos16, plan16, over, inplan,
++                             prevPf ? 1 : 0};
++        keep = taTreeL2V3(l2TreeV3, x15);
++    }
++    // Step 10: an output tensor no later layer reads: write-once data
++    bool outS = false;
++    if (outStream && role == 2 && tensor >= 0 &&
++        tensor < (int)users.size() && users[tensor]) {
++        const int last = 32 - __builtin_clz(users[tensor]);
++        outS = curLayer >= last;
++        if (outS)
++            keep = false;
++    }
++    if (keepPrefetch && x[1] == 3)
++        keep = true;
++    const bool treeKeep = keep;
++    if (keep)
++        ++taStats.keepDecisions;
++    else
++        ++taStats.averseDecisions;
++
++    // ---- set dueling against LRU ----
++    if (dueling) {
++        const unsigned g = set % 64;
++        // a first-touch miss happens under any policy: no evidence
++        const bool count = fill && !(duelSkipFirst && first) &&
++                           !(duelDemandOnly && x[1] == 3) &&
++                           !(duelReadsOnly && x[1] > 1);
++        if (g == 0) {
++            keep = true;                       // LRU leader
++            if (count) {
++                ++taStats.lruLeaderMisses;
++                psel = std::min(psel + 1, 1023);
++            }
++        } else if (g == 1) {
++            if (count) {                       // tree leader
++                ++taStats.treeLeaderMisses;
++                psel = std::max(psel - 1, 0);
++            }
++        } else if (psel < 512 || (duelLruDefault && psel == 512)) {
++            // LRU side; with duelLruDefault the hint-based working-set
++            // slice still applies (it does not depend on the learned tree)
++            keep = (duelLruDefault && wsApplies) ? wsKeep : true;
++            ++taStats.followerLruAccesses;
++        } else {
++            ++taStats.followerTreeAccesses;
++        }
++    }
++
++    // Step 10 applies on every set except the LRU leaders (kept pure LRU)
++    if (outS && !(dueling && set % 64 == 0))
++        keep = false;
++    // Step 12: duel this policy against a BRRIP-style mode
++    if (duelBrrip) {
++        const unsigned g2 = set % 64;
++        const bool cnt2 = fill && !(duelSkipFirst && first);
++        const bool brKeep = fill ? (++brCtr % 32 == 0) : true;
++        if (g2 == 2) {                         // BRRIP leader
++            keep = brKeep;
++            if (cnt2)
++                psel2 = std::min(psel2 + 1, 1023);
++        } else if (g2 == 3) {                  // our leader
++            if (cnt2)
++                psel2 = std::max(psel2 - 1, 0);
++        } else if (g2 > 3 && psel2 < 512 - 32) {
++            keep = brKeep;                     // BRRIP clearly better here
++        }
++    }
++    // Step 10b: bimodal insertion of streaming fills (not in LRU leaders)
++    if (bipStream > 0 && fill && !keep && !(dueling && set % 64 == 0) &&
++        ++bipCtr % bipStream == 0)
++        keep = true;
++
++    if (dump.is_open() && dumped < dumpMax) {
++        ++dumped;
++        dump << seq << ',' << line << ',' << tensor << ',' << fill;
++        for (int v : x)
++            dump << ',' << v;
++        dump << ',' << treeKeep << ',' << keep << '\n';
++    }
++
++    // ---- update the entry (RRPV semantics as replay_policy.sim_ours) ----
++    d->valid = true;
++    d->lastSeq = seq;
++    d->tensor = tensor;
++    if (keep) {
++        d->averse = false;
++        d->keepStamp = ++setKeep[set];
++    } else {
++        d->averse = true;
++    }
++}
++
++bool
++TensorAware::sliceDecision(Addr addr, Addr line, int tensor,
++                           bool &wsApplies, bool *inL2Out) const
++{
++    bool wsKeep = false;
++    wsApplies = false;
++    if (inL2Out)
++        *inL2Out = false;
++    if (setAware && tensor >= 0 && tensor < (int)keepBits.size() &&
++        !keepBits[tensor].empty()) {
++        const int idx = lineIndex(addr, tensor);
++        if (idx >= 0) {
++            wsApplies = true;
++            if (firstTouch && tensor < (int)ftState.size() &&
++                idx < (int)ftState[tensor].size()) {
++                uint8_t &stt = ftState[tensor][idx];
++                if (stt == 0) {
++                    const unsigned st = (addr >> blkShift) & (numSets - 1);
++                    const bool k = ftUsed[tensor] < ftQuota[tensor] &&
++                                   ftCnt[st] < ftPerSet;
++                    if (k) {
++                        ++ftUsed[tensor];
++                        ++ftCnt[st];
++                    }
++                    stt = k ? 1 : 2;
++                }
++                return stt == 1;
++            }
++            return idx < (int)keepBits[tensor].size() && keepBits[tensor][idx];
++        }
++    }
++    if (wsAlpha > 0 && tensor >= 0 && tensor < (int)wsPlan.size() &&
++        wsPlan[tensor]) {
++        if (((slicePack && packedT[tensor]) ||
++             (sliceContig && wsFrac[tensor] >= sliceContigMin)) &&
++            tHi[tensor] > tLo[tensor]) {
++            // keep the first wsFrac of the tensor's physical extent
++            const double pos = tensorPos(addr, tensor);
++            wsKeep = pos < wsFrac[tensor];
++        } else {
++            const uint64_t hsh =
++                ((uint64_t(line) * 2654435761ULL) >> 16) & 0xFF;
++            wsKeep = double(hsh) < wsFrac[tensor] * 256.0;
++        }
++        wsApplies = true;
++    }
++    // Step 6 coordination (L3): lines in the L2's slice are not kept here
++    // (the L2 holds them); of the other lines a slice of l3RestFrac is kept
++    // (second, independent hash), so L2 and L3 hold different parts.
++    if (coordL2Bytes > 0 && tensor >= 0 && tensor < (int)l2Frac.size() &&
++        l2Frac[tensor] > 0) {
++        bool inL2;
++        if (tHi[tensor] > tLo[tensor] &&
++            (coordL2Pack || l2Frac[tensor] >= coordL2ContigMin ||
++             (tensor < (int)coordPackedT.size() && coordPackedT[tensor]))) {
++            const double pos = tensorPos(addr, tensor);
++            inL2 = pos < l2Frac[tensor];
++        } else {
++            const uint64_t hsh =
++                ((uint64_t(line) * 2654435761ULL) >> 16) & 0xFF;
++            inL2 = double(hsh) < l2Frac[tensor] * 256.0;
++        }
++        const bool fitT = tensor < (int)coordPackedT.size() &&
++                          coordPackedT[tensor];
++        if (fitT && !inL2) {
++            // layer fits the L3: outside the L2 part the normal rule decides
++            return wsKeep;
++        }
++        if (inL2) {
++            wsKeep = false;
++            if (inL2Out)
++                *inL2Out = true;   // not kept here because the L2 holds it
++        } else if (slicePack && tHi[tensor] > tLo[tensor]) {
++            // packed: contiguous part of the lines outside the L2 slice
++            double pos = tensorPos(addr, tensor);
++            if (coordL2Pack || l2Frac[tensor] >= coordL2ContigMin ||
++                (tensor < (int)coordPackedT.size() && coordPackedT[tensor]))
++                pos = (pos - l2Frac[tensor]) / (1.0 - l2Frac[tensor]);
++            wsKeep = pos < l3RestFrac[tensor];
++        } else {
++            const uint64_t h2 =
++                ((uint64_t(line) * 0x9E3779B97F4A7C15ULL) >> 40) & 0xFF;
++            wsKeep = double(h2) < l3RestFrac[tensor] * 256.0;
++        }
++        wsApplies = true;
++    }
++    return wsKeep;
++}
++
++double
++TensorAware::tensorPos(Addr addr, int tensor) const
++{
++    if (posByBytes && tensor < (int)tSum.size() && tSum[tensor] > 0) {
++        auto it = ranges.upper_bound(addr);
++        if (it != ranges.begin()) {
++            --it;
++            if (addr < it->second.end && it->second.tensor == tensor)
++                return (it->second.cum + double(addr - it->first)) /
++                       tSum[tensor];
++        }
++    }
++    return double(addr - tLo[tensor]) / double(tHi[tensor] - tLo[tensor]);
++}
++
++int
++TensorAware::lineIndex(Addr addr, int tensor) const
++{
++    auto it = ranges.upper_bound(addr);
++    if (it == ranges.begin())
++        return -1;
++    --it;
++    if (addr >= it->second.end || it->second.tensor != tensor)
++        return -1;
++    return int((it->second.cum + double(addr - it->first)) / 64);
++}
++
++bool
++TensorAware::tensorDead(int t) const
++{
++    if (t < 0 || t >= (int)users.size() || !users[t])
++        return false;
++    const int last = 32 - __builtin_clz(users[t]);
++    return curLayer > last;          // its last user layer has finished
++}
++
++bool
++TensorAware::bypass(const PacketPtr pkt)
++{
++    if (!bypassStreaming || level != 3)
++        return false;
++    const Addr addr = pkt->getAddr();
++    const Addr line = addr >> blkShift;
++    const unsigned set = line & (numSets - 1);
++    if (dueling && set % 64 == 0)
++        return false;                // LRU leader sets stay plain LRU
++    const Range *r = lookup(addr);
++    const int tensor = r ? r->tensor : -1;
++    bool applies = false, inL2 = false;
++    const bool k = sliceDecision(addr, line, tensor, applies, &inL2);
++    // bypass only data no cache plans to keep (true streaming); the L2's
++    // part stays here as a low-priority backup (RRPV 7) in case L2 drops it
++    if (applies && !k && !inL2) {
++        ++bypassCount;
++        if ((bypassCount & (bypassCount - 1)) == 0)
++            inform("TensorAwareRP L3: %llu streaming fills bypassed",
++                   (unsigned long long)bypassCount);
++        return true;
++    }
++    return false;
++}
++
++void
++TensorAware::resetStats()
++{
++    Base::resetStats();
++    // Step 13: first touch counts from the start of the measured region
++    if (firstTouch) {
++        for (auto &v : ftState)
++            std::fill(v.begin(), v.end(), 0);
++        std::fill(ftUsed.begin(), ftUsed.end(), 0);
++        std::fill(ftCnt.begin(), ftCnt.end(), 0);
++    }
++    if (!resetHistory)
++        return;
++    lastAccess.clear();
++    for (auto &t : tstats)
++        t = TensorStat();
++    // seq keeps running: it is also the age used to break victim ties, and
++    // lines filled before the ROI must stay older than the ones filled after
++    psel = 512;
++    psel2 = 512;
++    curLayer = 1;
++    dumped = 0;
++}
++
++void
++TensorAware::invalidate(const std::shared_ptr<ReplacementData>& rd)
++{
++    auto d = std::static_pointer_cast<TAReplData>(rd);
++    d->valid = false;
++    d->averse = true;
++    d->lastSeq = 0;
++}
++
++void
++TensorAware::touch(const std::shared_ptr<ReplacementData>& rd,
++                   const PacketPtr pkt)
++{
++    // A CleanEvict carries no data (the upper cache only reports that it
++    // dropped a clean copy). The training traces skip it (belady.py), so the
++    // policy ignores it too: no decision, no history update.
++    if (pkt->cmd == MemCmd::CleanEvict)
++        return;
++    access(rd, pkt, false);
++}
++
++void
++TensorAware::reset(const std::shared_ptr<ReplacementData>& rd,
++                   const PacketPtr pkt)
++{
++    access(rd, pkt, true);
++}
++
++// Without a packet (block moves, not used by the classic set-associative
++// caches of this study): treat as a plain keep access.
++void
++TensorAware::touch(const std::shared_ptr<ReplacementData>& rd) const
++{
++    auto d = std::static_pointer_cast<TAReplData>(rd);
++    d->valid = true;
++    d->averse = false;
++}
++
++void
++TensorAware::reset(const std::shared_ptr<ReplacementData>& rd) const
++{
++    touch(rd);
++}
++
++ReplaceableEntry*
++TensorAware::getVictim(const ReplacementCandidates& candidates) const
++{
++    assert(candidates.size() > 0);
++    const uint64_t k = setKeep[candidates[0]->getSet() & (numSets - 1)];
++    ReplaceableEntry *victim = nullptr;
++    int best = -1;
++    uint64_t bestSeq = 0;
++    bool bestDirty = true;
++    for (const auto &c : candidates) {
++        auto d = std::static_pointer_cast<TAReplData>(c->replacementData);
++        int rrpv;
++        if (!d->valid)
++            rrpv = 8;
++        else if (d->averse || (deadDemote && tensorDead(d->tensor)))
++            rrpv = 7;
++        else
++            rrpv = int(std::min<uint64_t>(6, k - d->keepStamp));
++        // dirty-aware (Step 4): among equal RRPV, a clean line goes first
++        bool dirty = false;
++        if (dirtyAware && d->valid) {
++            auto blk = dynamic_cast<CacheBlk *>(c);
++            dirty = blk && blk->isSet(CacheBlk::DirtyBit);
++        }
++        if (rrpv > best ||
++            (rrpv == best && (dirty < bestDirty ||
++                              (dirty == bestDirty && d->lastSeq < bestSeq)))) {
++            best = rrpv;
++            bestSeq = d->lastSeq;
++            bestDirty = dirty;
++            victim = c;
++        }
++    }
++    return victim;
++}
++
++std::shared_ptr<ReplacementData>
++TensorAware::instantiateEntry()
++{
++    return std::shared_ptr<ReplacementData>(new TAReplData());
++}
++
++} // namespace replacement_policy
++} // namespace gem5
+diff --git a/src/mem/cache/replacement_policies/tensor_aware_rp.hh b/src/mem/cache/replacement_policies/tensor_aware_rp.hh
+new file mode 100644
+index 0000000000..510d17aa40
+--- /dev/null
++++ b/src/mem/cache/replacement_policies/tensor_aware_rp.hh
+@@ -0,0 +1,225 @@
++/*
++ * Tensor-aware replacement policy (UROP project, SRM University-AP).
++ *
++ * A small decision tree, learned offline from Belady's OPT on AI-layer
++ * traces, predicts for every access whether the line is worth keeping
++ * ("cache-friendly") or not. Inputs per access:
++ *   role_id, cmd_id, used_next, dead      (software tensor hint + request kind)
++ *   first_touch, prev_dist_log2           (per-line history at this level)
++ *   t_retouch8, t_dist                    (per-tensor reuse counters)
++ * Insertion / promotion (Hawkeye-style RRIP, 3 bits):
++ *   keep  -> RRPV 0, other kept lines in the set age by 1 (max 6)
++ *   not   -> RRPV 7 (first to go)
++ * Victim: highest RRPV, oldest access first on ties (invalid lines first).
++ * Safety net: set dueling against LRU (sets with set % 64 == 0 behave as
++ * LRU, set % 64 == 1 always follow the tree, the rest follow the winner,
++ * 10-bit PSEL).
++ *
++ * The tensor hint (which physical range belongs to which tensor, its role and
++ * the layers that use it; the PC ranges of the layer functions) is read from
++ * a text file (hint_file). Without a hint file every access is "other".
++ */
++
++#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_RP_HH__
++#define __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_RP_HH__
++
++#include <cstdint>
++#include <fstream>
++#include <map>
++#include <string>
++#include <unordered_map>
++#include <vector>
++
++#include "base/statistics.hh"
++#include "mem/cache/replacement_policies/base.hh"
++#include "mem/packet.hh"
++#include "sim/system.hh"
++
++namespace gem5
++{
++
++struct TensorAwareRPParams;
++
++namespace replacement_policy
++{
++
++class TensorAware : public Base
++{
++  protected:
++    struct TAReplData : ReplacementData
++    {
++        bool valid = false;
++        bool averse = true;      // RRPV 7
++        uint64_t keepStamp = 0;  // set keep-counter value at last keep access
++        uint64_t lastSeq = 0;    // access order (tie-break: oldest first)
++        int tensor = -1;         // Step 8: tensor of the line (dead demotion)
++    };
++
++    struct Range
++    {
++        Addr end;
++        int tensor;   // -1 = not a tensor
++        int role;
++        double cum = 0;  // Step 9: tensor bytes before this range
++    };
++
++    struct TensorStat
++    {
++        uint64_t n = 0;     // earlier accesses
++        uint64_t re = 0;    // earlier re-touches
++        double sumLd = 0;   // sum of log2(reuse distance / cache lines)
++    };
++
++    const int level;          // 2 or 3
++    const unsigned numSets;
++    const unsigned assoc;
++    const bool dueling;
++    const unsigned blkShift;
++    const double capLines;
++
++    // hint tables
++    std::map<Addr, Range> ranges;                    // start -> range
++    std::vector<std::pair<Addr, Addr>> layerPC;      // layer k at [k - 1]
++    std::vector<uint32_t> users;                     // tensor -> layer mask
++    std::vector<uint64_t> tbytes;                    // tensor -> bytes
++
++    // state
++    uint64_t seq = 0;
++    std::vector<uint64_t> setKeep;
++    struct LineHist
++    {
++        uint64_t seq;     // last access
++        uint32_t count;   // accesses so far
++        bool lastPf;      // Step 7: previous access was a prefetch fill
++    };
++    std::unordered_map<Addr, LineHist> lastAccess;   // line -> history
++    std::vector<TensorStat> tstats;                  // index tensor + 1
++    int psel = 512;
++    static int curLayer;                             // shared by L2 and L3
++
++    // optional dump of the first dumpMax decisions after the last stats
++    // reset (features, tree decision, final decision) for checking
++    std::ofstream dump;
++    const uint64_t dumpMax;
++    const bool resetHistory;
++    const double sliceBeta;  // thrash protection (0 = off), see access()
++    const bool sliceSizeHint;
++    const bool sliceSizeRatio;   // L2 form of the slice (exact size ratio)
++    const bool l2Alt;            // use taTreeL2Alt (Demand-MIN tree)
++    const double wsAlpha;        // Step 4 working-set slice (0 = off)
++    const bool dirtyAware;       // Step 4 clean-first victim tie-break
++    const bool duelSkipFirst;    // Step 4: PSEL ignores first-touch misses
++    const bool duelLruDefault;   // Step 4: LRU until the tree proves better
++    const bool duelDemandOnly;   // Step 5: PSEL counts demand misses only
++    const bool duelReadsOnly;    // Step 5 fix: PSEL counts demand read misses only
++    const bool treeOff;          // Step 5: learned tree not used (keep = true)
++    const bool sliceContig;      // Step 5: contiguous slice instead of hash
++    const double sliceContigMin; // Step 5: contiguous only if fraction >= this
++    const bool slicePack;            // Step 6: packing plan (whole tensors)
++    std::vector<char> wsPlan;        // tensor -> slice decision applies
++    const uint64_t coordL2Bytes;     // Step 6: L2 size (0 = no coordination)
++    const double coordL2Alpha;
++    const double coordL2ContigMin;
++    const bool coordL2Pack;          // Step 6: the L2 above packs
++    const int l2TreeV3;              // Step 7: learned L2 tree (-1 = off)
++    const uint64_t packMaxLayer;     // Step 7: pack only layers <= this (0 = all)
++    std::vector<char> packedT;       // Step 7: tensor uses the packed plan
++    const bool planAct;              // Step 9: plan reused input activations
++    const bool posByBytes;           // Step 9: position by tensor bytes
++    const bool outStream;            // Step 10: final outputs stream
++    const unsigned bipStream;        // Step 10b: 1-in-N streaming kept
++    const bool setAware;             // Step 11: set-aware plan
++    const unsigned setAwareWays;     // Step 12b: per-set cap (0 = alpha*ways)
++    const bool duelBrrip;            // Step 12: duel against BRRIP mode
++    const bool firstTouch;           // Step 13: first-touch set-aware plan
++    int ftPerSet = 0;
++    mutable std::vector<std::vector<uint8_t>> ftState; // 0 open,1 keep,2 no
++    mutable std::vector<uint64_t> ftUsed;               // kept per tensor
++    std::vector<uint64_t> ftQuota;                      // budget per tensor
++    mutable std::vector<uint16_t> ftCnt;                // kept per set
++    int psel2 = 512;
++    uint64_t brCtr = 0;
++    std::vector<std::vector<bool>> keepBits;  // tensor -> line kept (set-aware)
++    int lineIndex(Addr addr, int tensor) const;
++    uint64_t bipCtr = 0;
++    std::vector<double> tSum;        // Step 9: tensor bytes over its ranges
++    double tensorPos(Addr addr, int tensor) const;
++    const bool coordFit;             // Step 8: coordinate fitting layers too
++    std::vector<char> coordPackedT;  // Step 8: tensor's L2 part is contiguous
++    const bool deadDemote;           // Step 8: dead tensors evicted first
++    const bool bypassStreaming;      // Step 8: L3 bypass of streaming fills
++    uint64_t bypassCount = 0;
++    // hint slice + coordination decision (no side effects); applies = a
++    // slice rule covers this line
++    bool sliceDecision(Addr addr, Addr line, int tensor, bool &applies,
++                       bool *inL2Out = nullptr) const;
++    bool tensorDead(int t) const;
++  public:
++    bool bypass(const PacketPtr pkt) override;
++  protected:
++    std::vector<int> overLog2;       // Step 7: tensor -> log2(layer W / cache)
++    std::vector<double> l2Frac;      // tensor -> L2 slice fraction (as L2)
++    std::vector<double> l3RestFrac;  // tensor -> L3 share of the non-L2 lines
++    std::vector<Addr> tLo, tHi;  // tensor -> lowest / highest physical byte
++    const bool keepPrefetch;     // Step 5: prefetch fills always kept
++    const bool pfByRequestor;    // Step 5 fix: prefetch fills by requestor
++    System *system;
++    std::unordered_map<int, bool> pfRequestor;   // requestor id -> prefetcher
++    bool isPrefetcher(const PacketPtr pkt);
++    std::vector<double> wsFrac;  // tensor -> slice fraction (0 = none)
++    void computeWsFrac();
++    // per-tensor kept fraction for a cache of capBytes (pack or even slice)
++    std::vector<double> planFrac(double capBytes, double alpha, bool pack,
++                                 const std::vector<int> &trole,
++                                 std::vector<char> &plan,
++                                 const std::vector<double> *scale = nullptr) const;
++    uint64_t dumped = 0;
++
++    struct TAStats : public statistics::Group
++    {
++        TAStats(statistics::Group *parent);
++        statistics::Scalar keepDecisions;
++        statistics::Scalar averseDecisions;
++        statistics::Scalar lruLeaderMisses;
++        statistics::Scalar treeLeaderMisses;
++        statistics::Scalar followerTreeAccesses;
++        statistics::Scalar followerLruAccesses;
++        statistics::Scalar tensorAccesses;
++    } taStats;
++
++    void loadHints(const std::string &file);
++    const Range *lookup(Addr addr) const;
++    static int cmdId(const PacketPtr pkt);
++    bool predict(const int *x) const;
++    /** One access (hit or fill): decide keep / not and update the entry. */
++    void access(const std::shared_ptr<ReplacementData>& rd,
++                const PacketPtr pkt, bool fill);
++
++  public:
++    typedef TensorAwareRPParams Params;
++    TensorAware(const Params &p);
++    ~TensorAware() = default;
++
++    /** Start of the measured region (m5_reset_stats): forget the access
++     *  history, as the offline training features start at the ROI. */
++    void resetStats() override;
++
++    void invalidate(const std::shared_ptr<ReplacementData>& replacement_data)
++                                                                    override;
++    void touch(const std::shared_ptr<ReplacementData>& replacement_data,
++               const PacketPtr pkt) override;
++    void touch(const std::shared_ptr<ReplacementData>& replacement_data)
++                                                              const override;
++    void reset(const std::shared_ptr<ReplacementData>& replacement_data,
++               const PacketPtr pkt) override;
++    void reset(const std::shared_ptr<ReplacementData>& replacement_data)
++                                                              const override;
++    ReplaceableEntry* getVictim(const ReplacementCandidates& candidates)
++                                                              const override;
++    std::shared_ptr<ReplacementData> instantiateEntry() override;
++};
++
++} // namespace replacement_policy
++} // namespace gem5
++
++#endif // __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_RP_HH__
+diff --git a/src/mem/cache/replacement_policies/tensor_aware_tree.hh b/src/mem/cache/replacement_policies/tensor_aware_tree.hh
+new file mode 100644
+index 0000000000..5e481c9dca
+--- /dev/null
++++ b/src/mem/cache/replacement_policies/tensor_aware_tree.hh
+@@ -0,0 +1,683 @@
++// Generated by arch_study/trace_tools/export_tree.py - do not edit.
++// policy: policy_final_v2
++// x[]: 0=role_id, 1=cmd_id, 2=tsize_log2, 3=used_next, 4=dead, 5=first_touch, 6=prev_dist_log2, 7=n_prev, 8=t_retouch8, 9=t_dist
++// trees use: l2: role_id, cmd_id, used_next, dead, first_touch, prev_dist_log2, t_retouch8, t_dist (P(keep) >= 0.5); l3: role_id, cmd_id, tsize_log2, used_next, dead, first_touch, prev_dist_log2, n_prev, t_retouch8, t_dist (P(keep) >= 0.3)
++#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_HH__
++#define __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_HH__
++
++namespace gem5
++{
++namespace replacement_policy
++{
++
++inline bool
++taTreeL2(const int *x)
++{
++    if (x[6] <= 7) {  // prev_dist_log2
++        if (x[1] <= 0) {  // cmd_id
++            if (x[9] <= -9) {  // t_dist
++                if (x[0] <= 4) {  // role_id
++                    if (x[0] <= 1) {  // role_id
++                        if (x[8] <= 3) {  // t_retouch8
++                            return true;  // P(keep)=0.920 n=2912
++                        } else {
++                            return false;  // P(keep)=0.143 n=1228782
++                        }
++                    } else {
++                        if (x[6] <= 3) {  // prev_dist_log2
++                            return true;  // P(keep)=0.994 n=11807
++                        } else {
++                            return true;  // P(keep)=0.904 n=1814
++                        }
++                    }
++                } else {
++                    if (x[9] <= -12) {  // t_dist
++                        if (x[6] <= 5) {  // prev_dist_log2
++                            return false;  // P(keep)=0.013 n=136735
++                        } else {
++                            return false;  // P(keep)=0.496 n=960
++                        }
++                    } else {
++                        if (x[6] <= 6) {  // prev_dist_log2
++                            return false;  // P(keep)=0.322 n=18705
++                        } else {
++                            return false;  // P(keep)=0.063 n=1832
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 1) {  // role_id
++                    if (x[8] <= 7) {  // t_retouch8
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.108 n=148719
++                        } else {
++                            return false;  // P(keep)=0.278 n=493725
++                        }
++                    } else {
++                        if (x[9] <= -6) {  // t_dist
++                            return true;  // P(keep)=0.602 n=83549
++                        } else {
++                            return true;  // P(keep)=0.896 n=5251
++                        }
++                    }
++                } else {
++                    if (x[0] <= 4) {  // role_id
++                        if (x[9] <= -5) {  // t_dist
++                            return true;  // P(keep)=0.985 n=74640
++                        } else {
++                            return true;  // P(keep)=0.913 n=35903
++                        }
++                    } else {
++                        if (x[8] <= 5) {  // t_retouch8
++                            return false;  // P(keep)=0.172 n=1833
++                        } else {
++                            return true;  // P(keep)=0.782 n=531
++                        }
++                    }
++                }
++            }
++        } else {
++            if (x[8] <= 3) {  // t_retouch8
++                if (x[0] <= 4) {  // role_id
++                    if (x[0] <= 1) {  // role_id
++                        if (x[0] <= 0) {  // role_id
++                            return true;  // P(keep)=1.000 n=409
++                        } else {
++                            return true;  // P(keep)=0.999 n=3174
++                        }
++                    } else {
++                        return true;  // P(keep)=0.996 n=501
++                    }
++                } else {
++                    if (x[0] <= 8) {  // role_id
++                        if (x[8] <= 2) {  // t_retouch8
++                            return true;  // P(keep)=0.984 n=313
++                        } else {
++                            return true;  // P(keep)=0.650 n=94667
++                        }
++                    } else {
++                        return false;  // P(keep)=0.163 n=209
++                    }
++                }
++            } else {
++                if (x[0] <= 4) {  // role_id
++                    if (x[1] <= 2) {  // cmd_id
++                        if (x[9] <= -9) {  // t_dist
++                            return true;  // P(keep)=1.000 n=10005
++                        } else {
++                            return true;  // P(keep)=0.984 n=67087
++                        }
++                    } else {
++                        if (x[3] <= 0) {  // used_next
++                            return true;  // P(keep)=0.999 n=1220063
++                        } else {
++                            return true;  // P(keep)=0.852 n=546
++                        }
++                    }
++                } else {
++                    if (x[0] <= 5) {  // role_id
++                        if (x[9] <= -8) {  // t_dist
++                            return true;  // P(keep)=0.942 n=91531
++                        } else {
++                            return true;  // P(keep)=0.851 n=269
++                        }
++                    } else {
++                        if (x[9] <= -7) {  // t_dist
++                            return true;  // P(keep)=0.999 n=810
++                        } else {
++                            return true;  // P(keep)=0.988 n=727
++                        }
++                    }
++                }
++            }
++        }
++    } else {
++        if (x[8] <= 5) {  // t_retouch8
++            if (x[9] <= -9) {  // t_dist
++                if (x[0] <= 1) {  // role_id
++                    if (x[6] <= 8) {  // prev_dist_log2
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.049 n=1873
++                        } else {
++                            return false;  // P(keep)=0.378 n=582
++                        }
++                    } else {
++                        if (x[1] <= 1) {  // cmd_id
++                            return true;  // P(keep)=0.960 n=57755
++                        } else {
++                            return true;  // P(keep)=1.000 n=166675
++                        }
++                    }
++                } else {
++                    if (x[6] <= 13) {  // prev_dist_log2
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.267 n=5082
++                        } else {
++                            return false;  // P(keep)=0.015 n=10478
++                        }
++                    } else {
++                        if (x[0] <= 4) {  // role_id
++                            return true;  // P(keep)=0.883 n=6459
++                        } else {
++                            return false;  // P(keep)=0.268 n=5977
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 0) {  // role_id
++                    if (x[6] <= 11) {  // prev_dist_log2
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.051 n=2984
++                        } else {
++                            return false;  // P(keep)=0.356 n=208
++                        }
++                    } else {
++                        if (x[9] <= -3) {  // t_dist
++                            return true;  // P(keep)=0.994 n=33450
++                        } else {
++                            return false;  // P(keep)=0.351 n=248
++                        }
++                    }
++                } else {
++                    if (x[1] <= 1) {  // cmd_id
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.093 n=106361
++                        } else {
++                            return true;  // P(keep)=0.970 n=52469
++                        }
++                    } else {
++                        if (x[1] <= 2) {  // cmd_id
++                            return false;  // P(keep)=0.007 n=95535
++                        } else {
++                            return true;  // P(keep)=0.974 n=3265
++                        }
++                    }
++                }
++            }
++        } else {
++            if (x[0] <= 3) {  // role_id
++                if (x[9] <= -4) {  // t_dist
++                    if (x[1] <= 2) {  // cmd_id
++                        if (x[6] <= 17) {  // prev_dist_log2
++                            return true;  // P(keep)=0.989 n=2058531
++                        } else {
++                            return false;  // P(keep)=0.447 n=9542
++                        }
++                    } else {
++                        if (x[9] <= -6) {  // t_dist
++                            return true;  // P(keep)=1.000 n=569665
++                        } else {
++                            return true;  // P(keep)=0.998 n=9343
++                        }
++                    }
++                } else {
++                    if (x[8] <= 7) {  // t_retouch8
++                        if (x[6] <= 13) {  // prev_dist_log2
++                            return true;  // P(keep)=0.762 n=131397
++                        } else {
++                            return true;  // P(keep)=0.969 n=400725
++                        }
++                    } else {
++                        if (x[9] <= -2) {  // t_dist
++                            return true;  // P(keep)=0.986 n=895800
++                        } else {
++                            return true;  // P(keep)=0.899 n=284929
++                        }
++                    }
++                }
++            } else {
++                if (x[1] <= 0) {  // cmd_id
++                    if (x[9] <= -6) {  // t_dist
++                        if (x[6] <= 14) {  // prev_dist_log2
++                            return true;  // P(keep)=0.985 n=9880
++                        } else {
++                            return true;  // P(keep)=1.000 n=1985
++                        }
++                    } else {
++                        if (x[0] <= 4) {  // role_id
++                            return true;  // P(keep)=0.630 n=201265
++                        } else {
++                            return true;  // P(keep)=0.963 n=6746
++                        }
++                    }
++                } else {
++                    if (x[9] <= -4) {  // t_dist
++                        if (x[6] <= 10) {  // prev_dist_log2
++                            return true;  // P(keep)=0.943 n=9346
++                        } else {
++                            return true;  // P(keep)=0.997 n=11700
++                        }
++                    } else {
++                        if (x[6] <= 10) {  // prev_dist_log2
++                            return false;  // P(keep)=0.303 n=396
++                        } else {
++                            return true;  // P(keep)=0.955 n=556
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++inline bool
++taTreeL3(const int *x)
++{
++    if (x[7] <= 0) {  // n_prev
++        if (x[2] <= 0) {  // tsize_log2
++            if (x[2] <= -1) {  // tsize_log2
++                if (x[9] <= -3) {  // t_dist
++                    if (x[2] <= -3) {  // tsize_log2
++                        if (x[2] <= -4) {  // tsize_log2
++                            return true;  // P(keep)=0.941 n=2475
++                        } else {
++                            return false;  // P(keep)=0.174 n=6345
++                        }
++                    } else {
++                        if (x[0] <= 3) {  // role_id
++                            return true;  // P(keep)=0.655 n=63418
++                        } else {
++                            return false;  // P(keep)=0.000 n=578
++                        }
++                    }
++                } else {
++                    if (x[2] <= -3) {  // tsize_log2
++                        if (x[8] <= 0) {  // t_retouch8
++                            return false;  // P(keep)=0.018 n=372039
++                        } else {
++                            return true;  // P(keep)=0.349 n=9834
++                        }
++                    } else {
++                        if (x[2] <= -2) {  // tsize_log2
++                            return false;  // P(keep)=0.184 n=508263
++                        } else {
++                            return false;  // P(keep)=0.003 n=216918
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 0) {  // role_id
++                    return true;  // P(keep)=0.449 n=520511
++                } else {
++                    if (x[8] <= 1) {  // t_retouch8
++                        if (x[9] <= -2) {  // t_dist
++                            return false;  // P(keep)=0.116 n=124856
++                        } else {
++                            return false;  // P(keep)=0.035 n=234202
++                        }
++                    } else {
++                        if (x[0] <= 3) {  // role_id
++                            return true;  // P(keep)=0.645 n=84193
++                        } else {
++                            return false;  // P(keep)=0.090 n=22549
++                        }
++                    }
++                }
++            }
++        } else {
++            if (x[2] <= 2) {  // tsize_log2
++                if (x[0] <= 3) {  // role_id
++                    if (x[0] <= 1) {  // role_id
++                        if (x[2] <= 1) {  // tsize_log2
++                            return false;  // P(keep)=0.211 n=109328
++                        } else {
++                            return false;  // P(keep)=0.083 n=449641
++                        }
++                    } else {
++                        if (x[2] <= 1) {  // tsize_log2
++                            return true;  // P(keep)=0.896 n=5913
++                        } else {
++                            return false;  // P(keep)=0.000 n=772
++                        }
++                    }
++                } else {
++                    if (x[9] <= 4) {  // t_dist
++                        if (x[9] <= -3) {  // t_dist
++                            return false;  // P(keep)=0.000 n=4108
++                        } else {
++                            return false;  // P(keep)=0.005 n=69676
++                        }
++                    } else {
++                        return false;  // P(keep)=0.017 n=54032
++                    }
++                }
++            } else {
++                if (x[0] <= 1) {  // role_id
++                    if (x[0] <= 0) {  // role_id
++                        return false;  // P(keep)=0.000 n=545368
++                    } else {
++                        if (x[9] <= 3) {  // t_dist
++                            return false;  // P(keep)=0.002 n=183082
++                        } else {
++                            return false;  // P(keep)=0.003 n=4940
++                        }
++                    }
++                } else {
++                    if (x[0] <= 3) {  // role_id
++                        if (x[9] <= 3) {  // t_dist
++                            return false;  // P(keep)=0.000 n=14622
++                        } else {
++                            return true;  // P(keep)=0.473 n=32486
++                        }
++                    } else {
++                        return false;  // P(keep)=0.000 n=89610
++                    }
++                }
++            }
++        }
++    } else {
++        if (x[2] <= 0) {  // tsize_log2
++            if (x[6] <= 18) {  // prev_dist_log2
++                if (x[0] <= 0) {  // role_id
++                    if (x[6] <= 17) {  // prev_dist_log2
++                        if (x[6] <= 13) {  // prev_dist_log2
++                            return true;  // P(keep)=0.490 n=41214
++                        } else {
++                            return true;  // P(keep)=0.922 n=391895
++                        }
++                    } else {
++                        if (x[7] <= 3) {  // n_prev
++                            return true;  // P(keep)=0.757 n=681188
++                        } else {
++                            return false;  // P(keep)=0.000 n=118524
++                        }
++                    }
++                } else {
++                    if (x[9] <= -4) {  // t_dist
++                        if (x[7] <= 2) {  // n_prev
++                            return true;  // P(keep)=0.691 n=107349
++                        } else {
++                            return false;  // P(keep)=0.096 n=26456
++                        }
++                    } else {
++                        if (x[7] <= 1) {  // n_prev
++                            return false;  // P(keep)=0.143 n=95076
++                        } else {
++                            return true;  // P(keep)=0.476 n=40410
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 0) {  // role_id
++                    return false;  // P(keep)=0.000 n=75237
++                } else {
++                    return false;  // P(keep)=0.176 n=250
++                }
++            }
++        } else {
++            if (x[9] <= -3) {  // t_dist
++                if (x[8] <= 1) {  // t_retouch8
++                    if (x[2] <= 3) {  // tsize_log2
++                        if (x[8] <= 0) {  // t_retouch8
++                            return true;  // P(keep)=0.456 n=2310
++                        } else {
++                            return true;  // P(keep)=0.409 n=6325
++                        }
++                    } else {
++                        return false;  // P(keep)=0.000 n=719
++                    }
++                } else {
++                    if (x[8] <= 3) {  // t_retouch8
++                        if (x[8] <= 2) {  // t_retouch8
++                            return false;  // P(keep)=0.000 n=10750
++                        } else {
++                            return false;  // P(keep)=0.023 n=22379
++                        }
++                    } else {
++                        return false;  // P(keep)=0.000 n=24289
++                    }
++                }
++            } else {
++                if (x[6] <= 15) {  // prev_dist_log2
++                    if (x[2] <= 1) {  // tsize_log2
++                        return false;  // P(keep)=0.082 n=244
++                    } else {
++                        return false;  // P(keep)=0.000 n=989
++                    }
++                } else {
++                    return false;  // P(keep)=0.000 n=187311
++                }
++            }
++        }
++    }
++}
++
++// alternative L2 tree: policy_l2_pfopt_r1_export, P(keep) >= 0.5
++inline bool
++taTreeL2Alt(const int *x)
++{
++    if (x[6] <= 7) {  // prev_dist_log2
++        if (x[1] <= 0) {  // cmd_id
++            if (x[8] <= 7) {  // t_retouch8
++                if (x[0] <= 1) {  // role_id
++                    if (x[8] <= 6) {  // t_retouch8
++                        if (x[0] <= 0) {  // role_id
++                            return false;  // P(keep)=0.142 n=1552239
++                        } else {
++                            return false;  // P(keep)=0.205 n=486235
++                        }
++                    } else {
++                        if (x[9] <= -5) {  // t_dist
++                            return false;  // P(keep)=0.200 n=384690
++                        } else {
++                            return true;  // P(keep)=0.821 n=18161
++                        }
++                    }
++                } else {
++                    if (x[0] <= 4) {  // role_id
++                        if (x[9] <= -5) {  // t_dist
++                            return true;  // P(keep)=0.982 n=80077
++                        } else {
++                            return true;  // P(keep)=0.912 n=36017
++                        }
++                    } else {
++                        if (x[9] <= -12) {  // t_dist
++                            return false;  // P(keep)=0.017 n=138512
++                        } else {
++                            return false;  // P(keep)=0.302 n=23007
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 0) {  // role_id
++                    if (x[9] <= -4) {  // t_dist
++                        if (x[6] <= 2) {  // prev_dist_log2
++                            return true;  // P(keep)=0.609 n=7997
++                        } else {
++                            return true;  // P(keep)=0.603 n=75660
++                        }
++                    } else {
++                        if (x[6] <= 2) {  // prev_dist_log2
++                            return true;  // P(keep)=0.751 n=277
++                        } else {
++                            return true;  // P(keep)=0.775 n=2158
++                        }
++                    }
++                } else {
++                    if (x[0] <= 2) {  // role_id
++                        return true;  // P(keep)=1.000 n=7437
++                    } else {
++                        return true;  // P(keep)=0.994 n=6899
++                    }
++                }
++            }
++        } else {
++            if (x[8] <= 3) {  // t_retouch8
++                if (x[0] <= 4) {  // role_id
++                    if (x[0] <= 1) {  // role_id
++                        if (x[9] <= -6) {  // t_dist
++                            return true;  // P(keep)=0.999 n=3340
++                        } else {
++                            return true;  // P(keep)=0.996 n=242
++                        }
++                    } else {
++                        if (x[9] <= -11) {  // t_dist
++                            return true;  // P(keep)=0.988 n=512
++                        } else {
++                            return true;  // P(keep)=0.999 n=742
++                        }
++                    }
++                } else {
++                    if (x[0] <= 8) {  // role_id
++                        if (x[8] <= 2) {  // t_retouch8
++                            return true;  // P(keep)=0.980 n=354
++                        } else {
++                            return true;  // P(keep)=0.650 n=96113
++                        }
++                    } else {
++                        return false;  // P(keep)=0.176 n=216
++                    }
++                }
++            } else {
++                if (x[0] <= 4) {  // role_id
++                    if (x[3] <= 0) {  // used_next
++                        if (x[1] <= 2) {  // cmd_id
++                            return true;  // P(keep)=0.985 n=77114
++                        } else {
++                            return true;  // P(keep)=0.999 n=1457718
++                        }
++                    } else {
++                        if (x[9] <= -11) {  // t_dist
++                            return true;  // P(keep)=0.993 n=416
++                        } else {
++                            return true;  // P(keep)=0.872 n=1488
++                        }
++                    }
++                } else {
++                    if (x[0] <= 5) {  // role_id
++                        if (x[9] <= -8) {  // t_dist
++                            return true;  // P(keep)=0.942 n=91475
++                        } else {
++                            return true;  // P(keep)=0.830 n=265
++                        }
++                    } else {
++                        if (x[9] <= -6) {  // t_dist
++                            return true;  // P(keep)=0.997 n=1482
++                        } else {
++                            return true;  // P(keep)=0.935 n=307
++                        }
++                    }
++                }
++            }
++        }
++    } else {
++        if (x[8] <= 5) {  // t_retouch8
++            if (x[1] <= 2) {  // cmd_id
++                if (x[1] <= 1) {  // cmd_id
++                    if (x[9] <= -3) {  // t_dist
++                        if (x[0] <= 4) {  // role_id
++                            return true;  // P(keep)=0.903 n=162505
++                        } else {
++                            return false;  // P(keep)=0.253 n=13066
++                        }
++                    } else {
++                        if (x[8] <= 4) {  // t_retouch8
++                            return false;  // P(keep)=0.090 n=103344
++                        } else {
++                            return true;  // P(keep)=0.971 n=2186
++                        }
++                    }
++                } else {
++                    if (x[0] <= 2) {  // role_id
++                        if (x[6] <= 11) {  // prev_dist_log2
++                            return false;  // P(keep)=0.002 n=91856
++                        } else {
++                            return false;  // P(keep)=0.021 n=15024
++                        }
++                    } else {
++                        if (x[6] <= 13) {  // prev_dist_log2
++                            return true;  // P(keep)=0.935 n=1954
++                        } else {
++                            return false;  // P(keep)=0.281 n=295
++                        }
++                    }
++                }
++            } else {
++                if (x[8] <= 3) {  // t_retouch8
++                    if (x[6] <= 16) {  // prev_dist_log2
++                        return false;  // P(keep)=0.443 n=393
++                    } else {
++                        return false;  // P(keep)=0.423 n=645
++                    }
++                } else {
++                    if (x[0] <= 4) {  // role_id
++                        if (x[9] <= -7) {  // t_dist
++                            return true;  // P(keep)=1.000 n=278411
++                        } else {
++                            return true;  // P(keep)=0.994 n=1356
++                        }
++                    } else {
++                        return true;  // P(keep)=0.760 n=383
++                    }
++                }
++            }
++        } else {
++            if (x[0] <= 3) {  // role_id
++                if (x[6] <= 12) {  // prev_dist_log2
++                    if (x[3] <= 0) {  // used_next
++                        if (x[1] <= 1) {  // cmd_id
++                            return true;  // P(keep)=0.995 n=1718859
++                        } else {
++                            return true;  // P(keep)=0.984 n=362569
++                        }
++                    } else {
++                        if (x[9] <= -6) {  // t_dist
++                            return false;  // P(keep)=0.452 n=336
++                        } else {
++                            return true;  // P(keep)=0.865 n=483
++                        }
++                    }
++                } else {
++                    if (x[1] <= 2) {  // cmd_id
++                        if (x[6] <= 17) {  // prev_dist_log2
++                            return true;  // P(keep)=0.945 n=1875563
++                        } else {
++                            return false;  // P(keep)=0.331 n=34601
++                        }
++                    } else {
++                        if (x[9] <= -5) {  // t_dist
++                            return true;  // P(keep)=1.000 n=804928
++                        } else {
++                            return true;  // P(keep)=0.995 n=26498
++                        }
++                    }
++                }
++            } else {
++                if (x[1] <= 0) {  // cmd_id
++                    if (x[9] <= -6) {  // t_dist
++                        if (x[6] <= 14) {  // prev_dist_log2
++                            return true;  // P(keep)=0.983 n=10084
++                        } else {
++                            return true;  // P(keep)=1.000 n=2001
++                        }
++                    } else {
++                        if (x[0] <= 4) {  // role_id
++                            return true;  // P(keep)=0.632 n=201265
++                        } else {
++                            return true;  // P(keep)=0.964 n=6940
++                        }
++                    }
++                } else {
++                    if (x[9] <= -4) {  // t_dist
++                        if (x[6] <= 11) {  // prev_dist_log2
++                            return true;  // P(keep)=0.946 n=10466
++                        } else {
++                            return true;  // P(keep)=0.997 n=10852
++                        }
++                    } else {
++                        if (x[6] <= 11) {  // prev_dist_log2
++                            return false;  // P(keep)=0.367 n=591
++                        } else {
++                            return true;  // P(keep)=0.984 n=612
++                        }
++                    }
++                }
++            }
++        }
++    }
++}
++
++} // namespace replacement_policy
++} // namespace gem5
++
++#endif // __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_HH__
+diff --git a/src/mem/cache/tags/base.hh b/src/mem/cache/tags/base.hh
+index 71b50f6e6b..141ddab2c8 100644
+--- a/src/mem/cache/tags/base.hh
++++ b/src/mem/cache/tags/base.hh
+@@ -299,6 +299,9 @@ class BaseTags : public ClockedObject
+      */
+     virtual CacheBlk* accessBlock(const PacketPtr pkt, Cycles &lat) = 0;
+ 
++    /** Step 8 (arch_study): replacement policy asks to bypass this fill */
++    virtual bool wantBypass(const PacketPtr pkt) { return false; }
++
+     /**
+      * Generate the tag from the given address.
+      *
+diff --git a/src/mem/cache/tags/base_set_assoc.hh b/src/mem/cache/tags/base_set_assoc.hh
+index 8a394d6a99..43ca2b8f28 100644
+--- a/src/mem/cache/tags/base_set_assoc.hh
++++ b/src/mem/cache/tags/base_set_assoc.hh
+@@ -87,6 +87,15 @@ class BaseSetAssoc : public BaseTags
+     /** Replacement policy */
+     replacement_policy::Base *replacementPolicy;
+ 
++  public:
++    /** Step 8 (arch_study): ask the replacement policy */
++    bool wantBypass(const PacketPtr pkt) override
++    {
++        return replacementPolicy->bypass(pkt);
++    }
++
++  protected:
++
+   public:
+     /** Convenience typedef. */
+      typedef BaseSetAssocParams Params;
+diff --git a/src/mem/cache/replacement_policies/tensor_aware_tree_v3.hh b/src/mem/cache/replacement_policies/tensor_aware_tree_v3.hh
+new file mode 100644
+index 0000000000..f458ae05dc
+--- /dev/null
++++ b/src/mem/cache/replacement_policies/tensor_aware_tree_v3.hh
+@@ -0,0 +1,654 @@
++// Generated by arch_study/trace_tools/export_tree_v3.py - do not edit.
++// Step 7 learned L2 trees; x[]: 0=role_id, 1=cmd_id, 2=tsize_log2, 3=used_next, 4=dead, 5=first_touch, 6=prev_dist_log2, 7=n_prev, 8=t_retouch8, 9=t_dist, 10=pos16, 11=plan16, 12=over_log2, 13=inplan, 14=prev_pf
++// trees: 0 no-ViT, 1 no-BERT, 2 no-DLRM, 3 no-RNN-T, 4 all (P(keep) >= 0.3)
++#ifndef __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_V3_HH__
++#define __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_V3_HH__
++
++namespace gem5
++{
++namespace replacement_policy
++{
++
++inline bool
++taTreeL2V3_0(const int *x)
++{
++    if (x[14] <= 0) {  // prev_pf
++        if (x[1] <= 0) {  // cmd_id
++            if (x[11] <= 1) {  // plan16
++                if (x[0] <= 0) {  // role_id
++                    if (x[2] <= -2) {  // tsize_log2
++                        return true;  // P(keep)=1.000
++                    } else {
++                        if (x[10] <= 6) {  // pos16
++                            return true;  // P(keep)=0.901
++                        } else {
++                            return true;  // P(keep)=0.935
++                        }
++                    }
++                } else {
++                    if (x[0] <= 1) {  // role_id
++                        if (x[6] <= 12) {  // prev_dist_log2
++                            return true;  // P(keep)=0.997
++                        } else {
++                            return true;  // P(keep)=0.952
++                        }
++                    } else {
++                        if (x[6] <= 17) {  // prev_dist_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.999
++                        }
++                    }
++                }
++            } else {
++                if (x[13] <= 0) {  // inplan
++                    if (x[10] <= 4) {  // pos16
++                        return false;  // P(keep)=0.064
++                    } else {
++                        if (x[2] <= 1) {  // tsize_log2
++                            return false;  // P(keep)=0.057
++                        } else {
++                            return false;  // P(keep)=0.007
++                        }
++                    }
++                } else {
++                    return true;  // P(keep)=0.484
++                }
++            }
++        } else {
++            if (x[0] <= 6) {  // role_id
++                if (x[3] <= 0) {  // used_next
++                    if (x[2] <= -4) {  // tsize_log2
++                        if (x[10] <= 3) {  // pos16
++                            return true;  // P(keep)=0.984
++                        } else {
++                            return true;  // P(keep)=0.998
++                        }
++                    } else {
++                        if (x[10] <= 0) {  // pos16
++                            return true;  // P(keep)=0.997
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[12] <= -2) {  // over_log2
++                        if (x[5] <= 0) {  // first_touch
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        return true;  // P(keep)=0.336
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.514
++            }
++        }
++    } else {
++        if (x[11] <= 1) {  // plan16
++            if (x[7] <= 2) {  // n_prev
++                if (x[0] <= 0) {  // role_id
++                    if (x[2] <= -2) {  // tsize_log2
++                        return true;  // P(keep)=1.000
++                    } else {
++                        if (x[10] <= 2) {  // pos16
++                            return true;  // P(keep)=0.891
++                        } else {
++                            return true;  // P(keep)=0.842
++                        }
++                    }
++                } else {
++                    if (x[10] <= 0) {  // pos16
++                        if (x[9] <= -9) {  // t_dist
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.917
++                        }
++                    } else {
++                        if (x[2] <= -3) {  // tsize_log2
++                            return true;  // P(keep)=0.996
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.321
++            }
++        } else {
++            return false;  // P(keep)=0.000
++        }
++    }
++}
++
++inline bool
++taTreeL2V3_1(const int *x)
++{
++    if (x[14] <= 0) {  // prev_pf
++        if (x[1] <= 0) {  // cmd_id
++            if (x[11] <= 1) {  // plan16
++                if (x[2] <= -3) {  // tsize_log2
++                    if (x[0] <= 1) {  // role_id
++                        if (x[10] <= 1) {  // pos16
++                            return true;  // P(keep)=0.980
++                        } else {
++                            return true;  // P(keep)=0.996
++                        }
++                    } else {
++                        if (x[6] <= 18) {  // prev_dist_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.993
++                        }
++                    }
++                } else {
++                    if (x[9] <= -12) {  // t_dist
++                        return true;  // P(keep)=1.000
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                }
++            } else {
++                if (x[13] <= 0) {  // inplan
++                    if (x[11] <= 4) {  // plan16
++                        if (x[10] <= 4) {  // pos16
++                            return false;  // P(keep)=0.079
++                        } else {
++                            return false;  // P(keep)=0.006
++                        }
++                    } else {
++                        if (x[10] <= 11) {  // pos16
++                            return false;  // P(keep)=0.034
++                        } else {
++                            return false;  // P(keep)=0.158
++                        }
++                    }
++                } else {
++                    if (x[9] <= -10) {  // t_dist
++                        return true;  // P(keep)=0.609
++                    } else {
++                        return true;  // P(keep)=0.426
++                    }
++                }
++            }
++        } else {
++            if (x[0] <= 6) {  // role_id
++                if (x[3] <= 0) {  // used_next
++                    if (x[2] <= -3) {  // tsize_log2
++                        if (x[10] <= 1) {  // pos16
++                            return true;  // P(keep)=0.966
++                        } else {
++                            return true;  // P(keep)=0.997
++                        }
++                    } else {
++                        if (x[10] <= 0) {  // pos16
++                            return true;  // P(keep)=0.998
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[12] <= 0) {  // over_log2
++                        return true;  // P(keep)=1.000
++                    } else {
++                        return true;  // P(keep)=0.333
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.506
++            }
++        }
++    } else {
++        if (x[11] <= 1) {  // plan16
++            if (x[2] <= -5) {  // tsize_log2
++                return true;  // P(keep)=0.904
++            } else {
++                return true;  // P(keep)=1.000
++            }
++        } else {
++            return false;  // P(keep)=0.000
++        }
++    }
++}
++
++inline bool
++taTreeL2V3_2(const int *x)
++{
++    if (x[14] <= 0) {  // prev_pf
++        if (x[1] <= 0) {  // cmd_id
++            if (x[11] <= 1) {  // plan16
++                if (x[12] <= -1) {  // over_log2
++                    if (x[2] <= -4) {  // tsize_log2
++                        if (x[0] <= 1) {  // role_id
++                            return true;  // P(keep)=0.995
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                } else {
++                    if (x[0] <= 2) {  // role_id
++                        if (x[10] <= 1) {  // pos16
++                            return true;  // P(keep)=0.799
++                        } else {
++                            return true;  // P(keep)=0.910
++                        }
++                    } else {
++                        if (x[10] <= 14) {  // pos16
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.995
++                        }
++                    }
++                }
++            } else {
++                if (x[13] <= 0) {  // inplan
++                    if (x[2] <= 0) {  // tsize_log2
++                        return false;  // P(keep)=0.151
++                    } else {
++                        if (x[10] <= 12) {  // pos16
++                            return false;  // P(keep)=0.003
++                        } else {
++                            return false;  // P(keep)=0.082
++                        }
++                    }
++                } else {
++                    if (x[10] <= 2) {  // pos16
++                        return true;  // P(keep)=0.699
++                    } else {
++                        return true;  // P(keep)=0.377
++                    }
++                }
++            }
++        } else {
++            if (x[0] <= 5) {  // role_id
++                if (x[3] <= 0) {  // used_next
++                    if (x[10] <= 0) {  // pos16
++                        if (x[2] <= -3) {  // tsize_log2
++                            return true;  // P(keep)=0.935
++                        } else {
++                            return true;  // P(keep)=0.996
++                        }
++                    } else {
++                        if (x[2] <= -4) {  // tsize_log2
++                            return true;  // P(keep)=0.996
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[12] <= -1) {  // over_log2
++                        if (x[7] <= 0) {  // n_prev
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        return false;  // P(keep)=0.267
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.429
++            }
++        }
++    } else {
++        if (x[11] <= 1) {  // plan16
++            if (x[7] <= 2) {  // n_prev
++                if (x[2] <= -1) {  // tsize_log2
++                    if (x[10] <= 0) {  // pos16
++                        if (x[12] <= -1) {  // over_log2
++                            return true;  // P(keep)=0.977
++                        } else {
++                            return true;  // P(keep)=0.979
++                        }
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                } else {
++                    if (x[0] <= 0) {  // role_id
++                        if (x[10] <= 6) {  // pos16
++                            return true;  // P(keep)=0.865
++                        } else {
++                            return true;  // P(keep)=0.841
++                        }
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.369
++            }
++        } else {
++            if (x[11] <= 2) {  // plan16
++                return false;  // P(keep)=0.000
++            } else {
++                return false;  // P(keep)=0.000
++            }
++        }
++    }
++}
++
++inline bool
++taTreeL2V3_3(const int *x)
++{
++    if (x[14] <= 0) {  // prev_pf
++        if (x[7] <= 3) {  // n_prev
++            if (x[1] <= 2) {  // cmd_id
++                if (x[11] <= 1) {  // plan16
++                    if (x[10] <= 0) {  // pos16
++                        if (x[12] <= 0) {  // over_log2
++                            return true;  // P(keep)=0.949
++                        } else {
++                            return true;  // P(keep)=0.327
++                        }
++                    } else {
++                        if (x[2] <= -1) {  // tsize_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.963
++                        }
++                    }
++                } else {
++                    if (x[13] <= 0) {  // inplan
++                        if (x[11] <= 4) {  // plan16
++                            return false;  // P(keep)=0.027
++                        } else {
++                            return false;  // P(keep)=0.105
++                        }
++                    } else {
++                        if (x[2] <= 0) {  // tsize_log2
++                            return false;  // P(keep)=0.206
++                        } else {
++                            return true;  // P(keep)=0.892
++                        }
++                    }
++                }
++            } else {
++                if (x[0] <= 4) {  // role_id
++                    if (x[3] <= 0) {  // used_next
++                        if (x[11] <= 1) {  // plan16
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[12] <= -1) {  // over_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.946
++                        }
++                    }
++                } else {
++                    return true;  // P(keep)=0.968
++                }
++            }
++        } else {
++            if (x[7] <= 5) {  // n_prev
++                if (x[1] <= 1) {  // cmd_id
++                    if (x[6] <= 16) {  // prev_dist_log2
++                        if (x[12] <= -1) {  // over_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=0.962
++                        }
++                    } else {
++                        return true;  // P(keep)=0.467
++                    }
++                } else {
++                    if (x[2] <= -3) {  // tsize_log2
++                        if (x[10] <= 5) {  // pos16
++                            return true;  // P(keep)=0.929
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[8] <= 5) {  // t_retouch8
++                            return true;  // P(keep)=0.988
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                }
++            } else {
++                if (x[2] <= -4) {  // tsize_log2
++                    if (x[10] <= 13) {  // pos16
++                        if (x[10] <= 3) {  // pos16
++                            return true;  // P(keep)=0.992
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[0] <= 2) {  // role_id
++                            return true;  // P(keep)=0.979
++                        } else {
++                            return true;  // P(keep)=0.994
++                        }
++                    }
++                } else {
++                    if (x[8] <= 6) {  // t_retouch8
++                        if (x[10] <= 0) {  // pos16
++                            return true;  // P(keep)=0.995
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[7] <= 6) {  // n_prev
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                }
++            }
++        }
++    } else {
++        if (x[11] <= 1) {  // plan16
++            if (x[7] <= 1) {  // n_prev
++                if (x[2] <= -1) {  // tsize_log2
++                    if (x[9] <= -5) {  // t_dist
++                        if (x[6] <= 2) {  // prev_dist_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[10] <= 4) {  // pos16
++                            return true;  // P(keep)=0.936
++                        } else {
++                            return true;  // P(keep)=0.997
++                        }
++                    }
++                } else {
++                    if (x[0] <= 0) {  // role_id
++                        if (x[10] <= 6) {  // pos16
++                            return true;  // P(keep)=0.864
++                        } else {
++                            return true;  // P(keep)=0.892
++                        }
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.378
++            }
++        } else {
++            if (x[6] <= 2) {  // prev_dist_log2
++                return false;  // P(keep)=0.000
++            } else {
++                return false;  // P(keep)=0.000
++            }
++        }
++    }
++}
++
++inline bool
++taTreeL2V3_4(const int *x)
++{
++    if (x[14] <= 0) {  // prev_pf
++        if (x[1] <= 0) {  // cmd_id
++            if (x[11] <= 1) {  // plan16
++                if (x[12] <= -1) {  // over_log2
++                    if (x[2] <= -4) {  // tsize_log2
++                        if (x[10] <= 13) {  // pos16
++                            return true;  // P(keep)=0.999
++                        } else {
++                            return true;  // P(keep)=0.991
++                        }
++                    } else {
++                        if (x[2] <= -3) {  // tsize_log2
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[0] <= 2) {  // role_id
++                        if (x[10] <= 2) {  // pos16
++                            return true;  // P(keep)=0.840
++                        } else {
++                            return true;  // P(keep)=0.935
++                        }
++                    } else {
++                        if (x[9] <= -4) {  // t_dist
++                            return true;  // P(keep)=0.993
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                }
++            } else {
++                if (x[13] <= 0) {  // inplan
++                    if (x[11] <= 4) {  // plan16
++                        if (x[10] <= 4) {  // pos16
++                            return false;  // P(keep)=0.072
++                        } else {
++                            return false;  // P(keep)=0.008
++                        }
++                    } else {
++                        if (x[2] <= 0) {  // tsize_log2
++                            return false;  // P(keep)=0.213
++                        } else {
++                            return false;  // P(keep)=0.053
++                        }
++                    }
++                } else {
++                    if (x[2] <= 0) {  // tsize_log2
++                        return false;  // P(keep)=0.181
++                    } else {
++                        if (x[9] <= -11) {  // t_dist
++                            return true;  // P(keep)=0.988
++                        } else {
++                            return true;  // P(keep)=0.720
++                        }
++                    }
++                }
++            }
++        } else {
++            if (x[0] <= 6) {  // role_id
++                if (x[3] <= 0) {  // used_next
++                    if (x[2] <= -3) {  // tsize_log2
++                        if (x[10] <= 0) {  // pos16
++                            return true;  // P(keep)=0.962
++                        } else {
++                            return true;  // P(keep)=0.996
++                        }
++                    } else {
++                        if (x[10] <= 0) {  // pos16
++                            return true;  // P(keep)=0.997
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[12] <= -1) {  // over_log2
++                        if (x[9] <= -9) {  // t_dist
++                            return true;  // P(keep)=1.000
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        return true;  // P(keep)=0.342
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.564
++            }
++        }
++    } else {
++        if (x[11] <= 1) {  // plan16
++            if (x[7] <= 1) {  // n_prev
++                if (x[2] <= -1) {  // tsize_log2
++                    if (x[10] <= 0) {  // pos16
++                        if (x[3] <= 0) {  // used_next
++                            return true;  // P(keep)=0.935
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    } else {
++                        if (x[8] <= 3) {  // t_retouch8
++                            return true;  // P(keep)=0.994
++                        } else {
++                            return true;  // P(keep)=1.000
++                        }
++                    }
++                } else {
++                    if (x[0] <= 0) {  // role_id
++                        if (x[10] <= 9) {  // pos16
++                            return true;  // P(keep)=0.905
++                        } else {
++                            return true;  // P(keep)=0.849
++                        }
++                    } else {
++                        return true;  // P(keep)=1.000
++                    }
++                }
++            } else {
++                return true;  // P(keep)=0.437
++            }
++        } else {
++            if (x[2] <= -2) {  // tsize_log2
++                if (x[13] <= 0) {  // inplan
++                    return false;  // P(keep)=0.000
++                } else {
++                    return false;  // P(keep)=0.001
++                }
++            } else {
++                if (x[10] <= 0) {  // pos16
++                    if (x[2] <= 0) {  // tsize_log2
++                        if (x[4] <= 0) {  // dead
++                            return false;  // P(keep)=0.000
++                        } else {
++                            return false;  // P(keep)=0.000
++                        }
++                    } else {
++                        return false;  // P(keep)=0.000
++                    }
++                } else {
++                    return false;  // P(keep)=0.000
++                }
++            }
++        }
++    }
++}
++
++inline bool
++taTreeL2V3(int which, const int *x)
++{
++    switch (which) {
++      case 0: return taTreeL2V3_0(x);
++      case 1: return taTreeL2V3_1(x);
++      case 2: return taTreeL2V3_2(x);
++      case 3: return taTreeL2V3_3(x);
++      case 4: return taTreeL2V3_4(x);
++      default: return true;
++    }
++}
++
++} // namespace replacement_policy
++} // namespace gem5
++
++#endif // __MEM_CACHE_REPLACEMENT_POLICIES_TENSOR_AWARE_TREE_V3_HH__

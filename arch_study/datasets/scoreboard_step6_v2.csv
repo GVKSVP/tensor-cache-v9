@@ -1,0 +1,85 @@
+workload,rule,dram_MB,vs_lru,source_dataset,run_id
+BLOCK_bert,lru,56.2723,1.0,ai_kernels_block_trace_v4.csv,BTR001
+BLOCK_bert,fifo,56.3081,1.0006,ai_kernels_cmp_v1.csv,CMS025
+BLOCK_bert,random,90.8008,1.6136,ai_kernels_cmp_v1.csv,CMS026
+BLOCK_bert,treeplru,60.6337,1.0775,ai_kernels_cmp_v1.csv,CMS027
+BLOCK_bert,srrip,57.0837,1.0144,ai_kernels_block_pilot_v1.csv,BLK003
+BLOCK_bert,brrip,152.4637,2.7094,ai_kernels_block_pilot_v1.csv,BLK002
+BLOCK_bert,drrip,61.6358,1.0953,ai_kernels_cmp_v1.csv,CMS030
+BLOCK_bert,ship,78.9196,1.4025,ai_kernels_cmp_v1.csv,CMS031
+BLOCK_bert,shippc,110.7446,1.968,ai_kernels_cmp_v1.csv,CMS032
+BLOCK_dlrm,lru,85.4531,1.0,ai_kernels_block_trace_v3.csv,BTR002
+BLOCK_dlrm,fifo,85.4536,1.0,ai_kernels_cmp_v1.csv,CMS009
+BLOCK_dlrm,random,47.8873,0.5604,ai_kernels_cmp_v1.csv,CMS010
+BLOCK_dlrm,treeplru,77.8895,0.9115,ai_kernels_cmp_v1.csv,CMS011
+BLOCK_dlrm,srrip,63.5242,0.7434,ai_kernels_cmp_v1.csv,CMS012
+BLOCK_dlrm,brrip,39.2384,0.4592,ai_kernels_step4_base_v1.csv,S4R002
+BLOCK_dlrm,drrip,39.5624,0.463,ai_kernels_cmp_v1.csv,CMS014
+BLOCK_dlrm,ship,48.8452,0.5716,ai_kernels_cmp_v1.csv,CMS015
+BLOCK_dlrm,shippc,39.5235,0.4625,ai_kernels_cmp_v1.csv,CMS016
+BLOCK_mbv2,lru,8.1996,1.0,ai_kernels_block_trace_v3.csv,BTR006
+BLOCK_mbv2,fifo,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS049
+BLOCK_mbv2,random,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS050
+BLOCK_mbv2,treeplru,8.1997,1.0,ai_kernels_cmp_v1.csv,CMS051
+BLOCK_mbv2,srrip,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS052
+BLOCK_mbv2,brrip,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS053
+BLOCK_mbv2,drrip,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS054
+BLOCK_mbv2,ship,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS055
+BLOCK_mbv2,shippc,8.1996,1.0,ai_kernels_cmp_v1.csv,CMS056
+BLOCK_rn50,lru,2.4383,1.0,ai_kernels_block_trace_v3.csv,BTR005
+BLOCK_rn50,fifo,2.4354,0.9988,ai_kernels_cmp_v1.csv,CMS041
+BLOCK_rn50,random,2.4353,0.9988,ai_kernels_cmp_v1.csv,CMS042
+BLOCK_rn50,treeplru,2.4354,0.9988,ai_kernels_cmp_v1.csv,CMS043
+BLOCK_rn50,srrip,2.4384,1.0,ai_kernels_cmp_v1.csv,CMS044
+BLOCK_rn50,brrip,2.4355,0.9988,ai_kernels_cmp_v1.csv,CMS045
+BLOCK_rn50,drrip,2.4384,1.0,ai_kernels_cmp_v1.csv,CMS046
+BLOCK_rn50,ship,2.4355,0.9988,ai_kernels_cmp_v1.csv,CMS047
+BLOCK_rn50,shippc,2.4354,0.9988,ai_kernels_cmp_v1.csv,CMS048
+BLOCK_vit,lru,29.8045,1.0,ai_kernels_block_trace_v3.csv,BTR004
+BLOCK_vit,fifo,29.7582,0.9984,ai_kernels_cmp_v1.csv,CMS033
+BLOCK_vit,random,36.1976,1.2145,ai_kernels_cmp_v1.csv,CMS034
+BLOCK_vit,treeplru,29.841,1.0012,ai_kernels_cmp_v1.csv,CMS035
+BLOCK_vit,srrip,38.436,1.2896,ai_kernels_cmp_v1.csv,CMS036
+BLOCK_vit,brrip,88.2301,2.9603,ai_kernels_cmp_v1.csv,CMS037
+BLOCK_vit,drrip,42.7938,1.4358,ai_kernels_cmp_v1.csv,CMS038
+BLOCK_vit,ship,39.8727,1.3378,ai_kernels_cmp_v1.csv,CMS039
+BLOCK_vit,shippc,48.868,1.6396,ai_kernels_cmp_v1.csv,CMS040
+CHAIN_llama_decode,lru,646.2231,1.0,ai_kernels_block_trace_v3.csv,BTR001
+CHAIN_llama_decode,fifo,646.2242,1.0,ai_kernels_cmp_v1.csv,CMS001
+CHAIN_llama_decode,random,646.2596,1.0001,ai_kernels_cmp_v1.csv,CMS002
+CHAIN_llama_decode,treeplru,646.2188,1.0,ai_kernels_cmp_v1.csv,CMS003
+CHAIN_llama_decode,srrip,646.2135,1.0,ai_kernels_cmp_v1.csv,CMS004
+CHAIN_llama_decode,brrip,646.2904,1.0001,ai_kernels_cmp_v1.csv,CMS005
+CHAIN_llama_decode,drrip,646.287,1.0001,ai_kernels_cmp_v1.csv,CMS006
+CHAIN_llama_decode,ship,646.2323,1.0,ai_kernels_cmp_v1.csv,CMS007
+CHAIN_llama_decode,shippc,646.1206,0.9998,ai_kernels_cmp_v1.csv,CMS008
+CHAIN_rnnt_encoder,lru,159.1208,1.0,ai_kernels_block_trace_v3.csv,BTR003
+CHAIN_rnnt_encoder,fifo,159.1265,1.0,ai_kernels_cmp_v1.csv,CMS017
+CHAIN_rnnt_encoder,random,139.9004,0.8792,ai_kernels_cmp_v1.csv,CMS018
+CHAIN_rnnt_encoder,treeplru,152.2924,0.9571,ai_kernels_cmp_v1.csv,CMS019
+CHAIN_rnnt_encoder,srrip,155.7899,0.9791,ai_kernels_cmp_v1.csv,CMS020
+CHAIN_rnnt_encoder,brrip,146.314,0.9195,ai_kernels_step4_base_v1.csv,S4R001
+CHAIN_rnnt_encoder,drrip,146.4785,0.9205,ai_kernels_cmp_v1.csv,CMS022
+CHAIN_rnnt_encoder,ship,138.8967,0.8729,ai_kernels_cmp_v1.csv,CMS023
+CHAIN_rnnt_encoder,shippc,144.2389,0.9065,ai_kernels_cmp_v1.csv,CMS024
+BLOCK_vit,ours_v2,29.7795,0.9992,ai_kernels_step6_final.csv,S6G004
+BLOCK_bert,ours_v2,54.8953,0.9755,ai_kernels_step6_final.csv,S6G003
+BLOCK_dlrm,ours_v2,32.1999,0.3768,ai_kernels_step6_final.csv,S6G002
+CHAIN_rnnt_encoder,ours_v2,128.0714,0.8049,ai_kernels_step6_final.csv,S6G005
+BLOCK_rn50,ours_v2,2.4383,1.0,ai_kernels_step6_final.csv,S6G006
+BLOCK_mbv2,ours_v2,8.1996,1.0,ai_kernels_step6_final.csv,S6G007
+CHAIN_llama_decode,ours_v2,646.0947,0.9998,ai_kernels_step6_final.csv,S6G001
+BLOCK_bert,opt,,0.949,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_bert,opt_plus,,0.941,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_dlrm,opt,,0.412,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_dlrm,opt_plus,,0.277,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_mbv2,opt,,1,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_mbv2,opt_plus,,1,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_rn50,opt,,1,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_rn50,opt_plus,,1,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_vit,opt,,0.997,"l3_opt_plus.json (offline, LRU trace)",
+BLOCK_vit,opt_plus,,0.993,"l3_opt_plus.json (offline, LRU trace)",
+CHAIN_llama_decode,opt,,1,"l3_opt_plus.json (offline, LRU trace)",
+CHAIN_llama_decode,opt_plus,,1,"l3_opt_plus.json (offline, LRU trace)",
+CHAIN_rnnt_encoder,opt,,0.789,"l3_opt_plus.json (offline, LRU trace)",
+CHAIN_rnnt_encoder,opt_plus,,0.737,"l3_opt_plus.json (offline, LRU trace)",

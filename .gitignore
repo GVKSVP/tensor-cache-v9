@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+# Outputs created when someone runs the tests (keep the repo clean)
+arch_study/results/smoke_test/
+arch_study/results/my_*/
+arch_study/results/unseen_v9_*/
+arch_study/results/tensor_hints_unseen_v9/
+arch_study/datasets/smoke_test_results.csv
+arch_study/datasets/my_*.csv
+arch_study/datasets/*unseen_v9*.csv
+arch_study/ai_kernels/experiment_plan_smoke_test.csv
+arch_study/ai_kernels/experiment_plan_v9_full_local.csv
+arch_study/ai_kernels/experiment_plan_unseen_v9_*.csv
+arch_study/results/*.log
