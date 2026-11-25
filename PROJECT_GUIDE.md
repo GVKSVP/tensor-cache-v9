@@ -55,7 +55,7 @@ This guide covers everything the project did, why each decision was made, where 
 - 9 wins, 62 ties, 1 loss (UNET3D_down2, behind BRRIP by 0.5%).
 - **Never more than 2% worse than LRU.** Worst case: +0.01%.
 - **At least 5% better than LRU on average.** Achieved: 6.2%.
-- **Run time not slower.** Geomean 0.9986. The worst case is 0.07% slower, which is noise level.
+- **Run time:** geomean 0.9986 (0.14% faster on average); some workloads are up to 0.07% slower than LRU.
 - On the 7 multi-layer workloads (model blocks), v9 averages **0.821** against 0.943 for DRRIP, the best other rule.
 
 ---
@@ -270,7 +270,7 @@ results ──► results/<tag>/<run>/stats.txt ──► datasets/<name>.csv (o
 
 ### 7.1 Final scoreboard (all 72 workloads, 10 rules)
 
-- **Charts:** `results/final_charts_v2/`. Start with `final_scoreboard_part_differ.png` (the 18 workloads where rules differ), then `final_scoreboard_part1-5.png` (all 72) and `cache_stats_part1-5.png` (tables of DRAM MB, L2 and L3 hit %, L3 misses, time).
+- **Charts:** `results/final_charts_v2/`. Start with `final_scoreboard_part_differ.png` (the 15 workloads where rules differ by more than 0.5%), then `final_scoreboard_part1-5.png` (all 72) and `cache_stats_part1-5.png` (tables of DRAM MB, L2 and L3 hit %, L3 misses, time).
 - **Data:** `datasets/final_scoreboard_v2_wide.csv` (72 × 10 rules plus verdict), `_long.csv` (every run), `_cache_stats.csv`.
 
 **Where v9 wins clearly (DRAM vs LRU):**
@@ -287,7 +287,7 @@ results ──► results/<tag>/<run>/stats.txt ──► datasets/<name>.csv (o
 | BLOCK_bert | **0.958** | FIFO 1.001 |
 | UNET3D_out | **0.983** | TreePLRU 0.988 |
 
-**Why 54 workloads are ties.** Their DRAM traffic is already at the minimum: every byte is loaded exactly once. That's because the data fits in the 16 MiB L3 (38 workloads), every byte is used only once (5, e.g. the Llama FFN layers), or only a small part of a large table is touched (11). **Even OPT would tie there.** Replacement can only help when data is **bigger than the cache and reused**.
+**Why 57 workloads show no difference (54 layers + BLOCK_mbv2, BLOCK_rn50, CHAIN_llama_decode).** For the 54 layers: Their DRAM traffic is already at the minimum: every byte is loaded exactly once. That's because the data fits in the 16 MiB L3 (38 workloads), every byte is used only once (5, e.g. the Llama FFN layers), or only a small part of a large table is touched (11). **OPT cannot help there either:** in the recorded traces OPT saves 0.0% of L3 misses on all 54 layers (`trace_v1_summary.csv`; traces taken before the flush and prefetcher changes). Replacement can only help when data is **bigger than the cache and reused**.
 
 ### 7.2 Robustness (rule v8, which is v9 without the set-aware cap)
 
@@ -300,6 +300,21 @@ Run on 4 multi-layer workloads under changed conditions (`datasets/ai_kernels_ro
 | 2× work | 0.904 | 0.226 | 0.605 | 0.995 | 1.090 / 0.373 / 0.852 / 1.470 |
 
 Best or tied in every condition. The gains are **largest when the cache is under pressure** (8 MiB L3).
+
+### 7.3 Unseen workloads (24-25 Nov 2026, v9 frozen)
+
+4 workloads x 10 rules = 40 runs, all SUCCESS; checksums and instruction counts equal across rules; totals recomputed from `stats.txt` match. DRAM vs LRU:
+
+| Workload | v9 | Best other rule | Verdict |
+|---|---|---|---|
+| GPT-2 XL block | **0.782** | Random 0.944 | win |
+| DLRM batch 128 (close to a tuned workload) | **0.376** | BRRIP 0.460 | win |
+| BERT-Base block | 0.997 | FIFO 0.999 | tie (0.16%) |
+| ResNet-50 stage 3 | 1.000 | 1.000 | tie (fits in L3) |
+| Geomean of 4 | **0.736** | Random 0.894 | |
+| Geomean without DLRM | **0.920** | FIFO 0.9996 | |
+
+Worst case 1.000015; run time geomean 0.9955, worst 1.000005. Files: `datasets/unseen_v9_summary.csv`, `unseen_v9_cache_stats.csv`, `results/unseen_charts_v9/`; copies for the kit and GitHub: `datasets/unseen_v9_reference/` and `results/unseen_v9_reference/` (charts, hints); launcher `results/launch_unseen_v9b.sh` (stops on any failure; `launch_unseen_v9.sh` does not).
 
 ---
 
@@ -375,7 +390,7 @@ One row per gem5 run (status, instructions, cycles, cache hits/misses per level,
 | `tensor_hints_layers/`, `tensor_hints_v3/` | **Hint files used by v9's final results** |
 | `final_charts_v2/` | **Final images** |
 | `gem5_rp_backup_step*/` | gem5 source backups and binaries per step, **including the v9 binary** |
-| `launch_*.sh`, `progress*.sh`, `queue_*.sh` | Launchers used to run long batches. **`launch_unseen_v9.sh` = next test.** |
+| `launch_*.sh`, `progress*.sh`, `queue_*.sh` | Launchers used to run long batches. **`launch_unseen_v9b.sh` = our unseen test (done); `launch_unseen_v9.sh` = the version to rerun it elsewhere.** |
 | `*.log` | Run logs |
 
 ### 8.6 `report/`
@@ -386,7 +401,7 @@ One row per gem5 run (status, instructions, cycles, cache hits/misses per level,
 
 ## 9. How to test (teammate)
 
-Everything needed is in **`tensor_cache_testing_kit_v2.zip`**. For the **complete step-by-step setup** (WSL, tools, gem5 + v9, installing v9 into your own gem5, using v9 in your own scripts, troubleshooting), follow **`SETUP_GUIDE.md`**. `README_TESTING.md` is the short version. In short:
+Everything needed is in **`tensor_cache_testing_kit_v4.zip`**. For the **complete step-by-step setup** (WSL, tools, gem5 + v9, installing v9 into your own gem5, using v9 in your own scripts, troubleshooting), follow **`SETUP_GUIDE.md`**. `README_TESTING.md` is the short version. In short:
 
 1. Linux or WSL2, ≥ 8 GB RAM, about 40 GB of disk. Install the gem5 build packages, Python with pandas, numpy and pyarrow, and `binutils-riscv64-linux-gnu` (RISC-V `readelf`/`nm`, needed only for making hint files in the unseen test).
 2. Put the project at `~/gem5-project/arch_study`.
@@ -405,12 +420,12 @@ Everything needed is in **`tensor_cache_testing_kit_v2.zip`**. For the **complet
 | # | Task | Status | How |
 |---|---|---|---|
 | 1 | **Teammate reproduces results** | Kit ready | Section 9 |
-| 2 | **Unseen-workload test**: 4 blocks v9 never saw (BERT-Base, GPT-2 XL, DLRM batch 128, ResNet-50 stage 3) × 10 rules | Script ready, **not run yet** | Pilot: `bash results/launch_unseen_v9.sh BLOCK_rn50s3`; full: `bash results/launch_unseen_v9.sh` (about 2–3 h). It runs profiling → hint files → checks the hints exist → v9 and 8 rules → summary in `datasets/unseen_v9_summary.csv`. |
+| 2 | **Unseen-workload test (DONE 25 Nov, see 7.3)**: 4 blocks v9 never saw (BERT-Base, GPT-2 XL, DLRM batch 128, ResNet-50 stage 3) × 10 rules | Done | Pilot: `bash results/launch_unseen_v9.sh BLOCK_rn50s3`; full: `bash results/launch_unseen_v9.sh` (about 7 h). It runs profiling → hint files → checks the hints exist → v9 and 8 rules → summary in `datasets/unseen_v9_summary.csv`. |
 | 3 | Smaller-cache study (optional) | Idea | Rerun all rules with L3 = 8 MiB; robustness already shows big v9 gains there |
 | 4 | **Final report** | To do | Rewrite with v9 results; Phase 1 can only be described in words (its data was deleted) |
 | 5 | Retraining (optional) | Possible | Needs the trace folders in `results/` (kept) |
 
-**Expectations for the unseen test (guesses, not results):** DLRM-128 should be a big win (like BLOCK_dlrm), BERT-Base a small win, ResNet-50 stage 3 a tie (it fits in L3), and GPT-2 XL is the real unknown.
+**Expectations written before the unseen test (results in 7.3):** DLRM-128 should be a big win (like BLOCK_dlrm), BERT-Base a small win, ResNet-50 stage 3 a tie (it fits in L3), and GPT-2 XL is the real unknown.
 
 ---
 
@@ -437,7 +452,7 @@ Everything needed is in **`tensor_cache_testing_kit_v2.zip`**. For the **complet
 - **Don't** use `pkill -f` or `pgrep -f` with text that appears in your own command line (it kills your own shell).
 - **Don't** delete `results/tensor_hints_*`, `results/policy_final_v2/`, `results/final_charts_v2/`, `datasets/` or the v9 binary.
 - **Don't** zip WSL folders with Windows "Send to → Compressed folder"; it fails with error 0x80070006. Zip from Linux instead.
-- **Don't** claim results on the unseen workloads until the test has actually been run.
+- **Don't** quote the unseen geomean (0.736) without saying that DLRM-128 resembles a tuned workload (0.920 without it).
 
 ---
 
@@ -446,10 +461,10 @@ Everything needed is in **`tensor_cache_testing_kit_v2.zip`**. For the **complet
 1. **Simulation only.** gem5, not real hardware.
 2. **Model-derived kernels**: real layer shapes, sampled work, plain C (no BLAS, no vector instructions). This is not a full MLPerf run.
 3. **v9 needs hint files**, made by profiling runs here. A real system would get them from the AI framework.
-4. **Gains appear only when data is bigger than the cache and reused**: 18 of 72 workloads here.
+4. **Gains appear only when data is bigger than the cache and reused**: 15 of 72 workloads here.
 5. **One loss:** UNET3D_down2 (0.957 vs BRRIP 0.952), where L3 misses are already nearly compulsory.
 6. The robustness numbers are for v8; v9 adds only the set-aware cap.
-7. The unseen-workload test hasn't been run yet.
+7. The unseen test (section 7.3) has only 4 workloads, 2-6 sampled work units each; DLRM-128 is close to the DLRM used in tuning. It is evidence of generalisation, not proof. The other 72 results were seen during tuning.
 8. Phase 1 (56k baseline) data was deleted, so it can't be re-analysed.
 
 ---

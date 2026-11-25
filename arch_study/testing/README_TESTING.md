@@ -110,7 +110,7 @@ python3 testing/check_smoke_test.py datasets/smoke_test_results.csv
 | DLRM_top_mlp | 84.01 | 38.77 | **26.21** | 0.312 |
 | RNNT_enc_pre1 | 83.04 | 36.60 | **25.30** | 0.305 |
 
-The checker prints PASS for each row when your number is within 1% of ours. In our own test from a freshly unzipped kit: LRU and v9 within ±0.01%, DRRIP within −0.4%. The small differences come from the different folder path, which shifts memory addresses slightly.
+The checker prints PASS for each row when your number is within 1% of ours. In our own test from a freshly unzipped kit: LRU and v9 within ±0.01%, DRRIP within −0.4%. DRRIP differs by up to 0.4% when the project is in another folder. In the original folder all 9 runs repeat bit for bit (checked 24 Nov 2026), so the older gem5 build is not the cause; a shift of memory addresses from the folder path is the likely one, not directly proven.
 
 ## Step 6 (optional): Full test of v9 on all 72 workloads
 
@@ -133,10 +133,14 @@ Compare with our results in `datasets/ai_kernels_v9_full.csv`. The `dram_bytes_r
 ```bash
 cd ~/gem5-project/arch_study
 bash results/launch_unseen_v9.sh BLOCK_rn50s3     # pilot on 1 workload first
-bash results/launch_unseen_v9.sh                  # then all 4 (about 2-3 h)
+bash results/launch_unseen_v9.sh                  # then all 4 (about 7 h)
 ```
 
 Result: `datasets/unseen_v9_summary.csv` (DRAM traffic of every rule vs LRU).
+
+**Check after it finishes:** `launch_unseen_v9.sh` does **not** stop if one run fails, so make sure both new CSVs (`datasets/ai_kernels_unseen_v9_lru.csv` and `..._rules.csv`) have `SUCCESS` in every row (4 + 36). `launch_unseen_v9b.sh` is the stricter launcher used for our own run. It is included as a record only: it needs our saved v9 binary and plan files, which are not in the kit.
+
+Our own results, to compare with (never overwrite them): `datasets/unseen_v9_reference/` (40 runs + summary), `results/unseen_v9_reference/charts/` (chart + tables) and `results/unseen_v9_reference/hints/` (the hint files we used). Expected v9 / LRU DRAM: GPT-2 XL 0.782, DLRM-128 0.376, BERT-Base 0.997, ResNet-50 stage 3 1.000.
 
 ---
 

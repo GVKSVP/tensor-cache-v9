@@ -21,7 +21,7 @@ def why(w):
 order=pd.concat([W[W.kind=='block'].sort_index(), W[(W.kind=='layer')&~fit].sort_index(), W[(W.kind=='layer')&fit].sort_index()])
 RULES=STD+['v9']; n=len(RULES); bw=0.085; CAP=1.5
 pages=[order.iloc[i:i+15] for i in range(0,len(order),15)]
-FOCUS=order[~fit.reindex(order.index)]
+FOCUS=order[(order[RULES].astype(float)-1).abs().max(axis=1)>0.005]
 plt.rcParams.update({'font.family':'DejaVu Sans','font.size':11})
 for pi,P in [('_differ',FOCUS)]+list(enumerate(pages,1)):
     fig,ax=plt.subplots(figsize=(max(22,1.47*len(P)),8.5),dpi=150); fig.patch.set_facecolor(SURF); ax.set_facecolor(SURF)

@@ -18,7 +18,7 @@ This guide takes you from **nothing installed** to **"PASS: results reproduced"*
 | 6 | Prepare the test | 1 min |
 | 7 | Quick check (9 runs) | **about 30 min** |
 | 8 | (Optional) full 72-workload run | several hours |
-| 9 | (Optional, when the team decides) unseen test | 2–3 hours |
+| 9 | (Optional, when the team decides) unseen test | about 7 hours |
 | 10 | Troubleshooting | — |
 | 11 | Using v9 in your own gem5 scripts | — |
 
@@ -102,12 +102,12 @@ The scripts expect **exactly** these folders:
 ~/gem5/                       <- the gem5 simulator (Part 4)
 ```
 
-1. Save `tensor_cache_testing_kit_v2.zip` in your Windows **Downloads** folder.
+1. Save `tensor_cache_testing_kit_v4.zip` in your Windows **Downloads** folder.
 2. In Ubuntu, copy it in and unzip it **with Linux `unzip`**. Don't use Windows "Extract All"; it removes file permissions.
    ```bash
    cd ~
-   cp /mnt/c/Users/<YOUR_WINDOWS_NAME>/Downloads/tensor_cache_testing_kit_v2.zip ~/
-   unzip -q tensor_cache_testing_kit_v2.zip
+   cp /mnt/c/Users/<YOUR_WINDOWS_NAME>/Downloads/tensor_cache_testing_kit_v4.zip ~/
+   unzip -q tensor_cache_testing_kit_v4.zip
    cp -r tensor_cache_project/arch_study ~/gem5-project/
    ls ~/gem5-project/arch_study            # you should see PROJECT_GUIDE.md, testing, ai_kernels, ...
    ```
@@ -268,7 +268,7 @@ python3 testing/check_smoke_test.py datasets/smoke_test_results.csv
 | DLRM_top_mlp | 84.01 | 38.77 | **26.21** | 0.312 |
 | RNNT_enc_pre1 | 83.04 | 36.60 | **25.30** | 0.305 |
 
-gem5 is deterministic, so the numbers match **very closely**. In our own test from a freshly unzipped kit: LRU and v9 within ±0.01%, DRRIP within −0.4%. Tiny differences come from the project sitting in a different folder path, which shifts memory addresses slightly. The checker allows ±1%.
+gem5 is deterministic, so the numbers match **very closely**. In our own test from a freshly unzipped kit: LRU and v9 within ±0.01%, DRRIP within −0.4%. DRRIP differs by up to 0.4% when the project is in another folder. In the original folder all 9 runs repeat bit for bit (checked 24 Nov 2026), so the older gem5 build is not the cause; a shift of memory addresses from the folder path is the likely one, not directly proven. The checker allows ±1%.
 
 **Rerunning:** the runner skips runs that already succeeded. To start completely fresh, use **new** names for `--out` and `--results` (e.g. `smoke_test2`).
 
@@ -301,11 +301,15 @@ nohup python3 run_ai_kernels_flush14.py \
 ```bash
 cd ~/gem5-project/arch_study
 bash results/launch_unseen_v9.sh BLOCK_rn50s3      # pilot: 1 workload first
-bash results/launch_unseen_v9.sh                   # then all 4 (about 2-3 h)
+bash results/launch_unseen_v9.sh                   # then all 4 (about 7 h)
 cat datasets/unseen_v9_summary.csv                 # result: every rule vs LRU
 ```
 
 It needs the Python environment from Part 2 (`~/gem5-project/.venv`) and `binutils-riscv64-linux-gnu`. If a hint file is missing, the script **stops** instead of running v9 without hints.
+
+**Check after it finishes:** `launch_unseen_v9.sh` does **not** stop if one run fails, so make sure both new CSVs (`datasets/ai_kernels_unseen_v9_lru.csv` and `..._rules.csv`) have `SUCCESS` in every row (4 + 36). `launch_unseen_v9b.sh` is the stricter launcher used for our own run. It is included as a record only: it needs our saved v9 binary and plan files, which are not in the kit.
+
+Our own results, to compare with (never overwrite them): `datasets/unseen_v9_reference/` (40 runs + summary), `results/unseen_v9_reference/charts/` (chart + tables) and `results/unseen_v9_reference/hints/` (the hint files we used). Expected v9 / LRU DRAM: GPT-2 XL 0.782, DLRM-128 0.376, BERT-Base 0.997, ResNet-50 stage 3 1.000.
 
 ---
 

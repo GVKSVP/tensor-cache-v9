@@ -1,0 +1,5 @@
+layer_id,lru,fifo,random,treeplru,srrip,brrip,drrip,ship,shippc,v9,best_other,best_other_vs_lru
+BLOCK_bertbase,1.0,0.9987,1.2073,0.9993,1.2921,2.3698,1.4955,1.3416,2.1495,0.9971,fifo,0.9987
+BLOCK_dlrm128,1.0,1.0,0.5611,0.8742,0.8412,0.4605,0.4665,0.5687,0.4658,0.3757,brrip,0.4605
+BLOCK_gpt2xl,1.0,1.0001,0.9442,1.0002,1.0077,0.966,0.9773,0.9783,0.9721,0.7818,random,0.9442
+BLOCK_rn50s3,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,fifo,1.0

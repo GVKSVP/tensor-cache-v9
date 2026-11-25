@@ -8,7 +8,20 @@ UROP project: a tensor-aware replacement rule (**v9**, gem5 `TensorAwareRP`) for
 |---|---|---|---|---|---|---|---|---|
 | **0.938** | 0.963 | 0.972 | 0.978 | 0.979 | 0.984 | 0.986 | 0.995 | 1.000 |
 
-v9 has 9 wins, 62 ties and 1 loss (0.5%), and is never more than 0.01% worse than LRU. On the 7 multi-layer blocks it averages **0.821** (DRRIP 0.943).
+v9 has 9 wins, 62 ties and 1 loss (0.5%), and was never more than 0.01% worse than LRU in these tests. On the 7 multi-layer blocks it averages **0.821** (DRRIP 0.943).
+
+**Unseen workloads** (25 Nov 2026; v9 frozen before the test; 4 workloads × 10 rules = 40 runs, all successful), DRAM traffic relative to LRU:
+
+| Workload | v9 | Best other rule | Result |
+|---|---|---|---|
+| GPT-2 XL block | **0.782** | Random 0.944 | Win |
+| DLRM, batch 128 | **0.376** | BRRIP 0.460 | Win (similar to a tuned workload) |
+| BERT-Base block | 0.997 | FIFO 0.999 | Tie |
+| ResNet-50 stage 3 | 1.000 | 1.000 | Tie (fits in L3) |
+| Geomean of 4 | **0.736** | Random 0.894 | |
+| Geomean without DLRM | **0.920** | FIFO 1.000 | |
+
+This is evidence of generalisation, not proof: only 4 workloads, with 2–6 sampled work units each. Run time barely changes (geomean 0.9955). [Chart](arch_study/results/unseen_v9_reference/charts/unseen_dram_chart.png) · [all tables](arch_study/results/unseen_v9_reference/charts/unseen_tables.png) · [data](arch_study/datasets/unseen_v9_reference/)
 
 ## Start here
 

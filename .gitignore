@@ -13,3 +13,5 @@ arch_study/ai_kernels/experiment_plan_smoke_test.csv
 arch_study/ai_kernels/experiment_plan_v9_full_local.csv
 arch_study/ai_kernels/experiment_plan_unseen_v9_*.csv
 arch_study/results/*.log
+# ...but keep our own reference results
+!arch_study/results/unseen_v9_reference/
